@@ -1,0 +1,48 @@
+[package]
+name = "plexus-auth-core"
+version = "0.1.0"
+edition = "2021"
+description = "Sealed-type primitives for the Plexus auth framework: AuthContext, VerifiedUser, Principal."
+license = "AGPL-3.0-only"
+
+# Why this is its own crate:
+#
+# Module-private constructors within `plexus-core` are a procedural defense —
+# they rely on contributors respecting visibility within a single crate. A future
+# PR to plexus-core that adds a `pub fn forge_auth_context()` would compile.
+# Review would catch it; the type system would not.
+#
+# `plexus-auth-core` exists so the auth primitives have a home that no other
+# crate can bypass. Combined with Rust's orphan rules and crate-private
+# constructors, this escalates the seal from procedural to structural:
+#
+#   - No fabrication: no public constructor reachable from other crates
+#   - No backdoor From / Into: orphan rules forbid third crates from adding any
+#   - No accidental Default: explicitly NOT derived
+#   - No leaky Deserialize: routed through the verifier or absent
+#   - No mutation: fields private to plexus-auth-core
+#
+# See AUTHZ-0 §"Crate-level isolation amplifies the seal" and the ticket
+# AUTHZ-CORE-CRATE-1 for the full rationale.
+
+[lib]
+name = "plexus_auth_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization. Note: Deserialize is intentionally implemented in a way that
+# documents the seal rather than offering a back-door. See module docs.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Schema generation, for IR/codegen integration.
+schemars = { version = "1.1", features = ["derive"] }
+
+# Async-trait so the SessionValidator-shaped traits can live here in the future.
+async-trait = "0.1"
+
+[dev-dependencies]
+# trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
+# Principal cannot be constructed from outside this crate.
+trybuild = "1.0"
+tokio = { version = "1", features = ["macros", "rt"] }
