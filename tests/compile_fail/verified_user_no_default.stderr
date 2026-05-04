@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `VerifiedUser: Default` is not satisfied
+ --> tests/compile_fail/verified_user_no_default.rs:8:27
+  |
+8 |     let _: VerifiedUser = Default::default();
+  |                           ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `VerifiedUser`

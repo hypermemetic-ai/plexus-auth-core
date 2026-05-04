@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `AuthContext: Default` is not satisfied
+  --> tests/compile_fail/auth_context_no_default.rs:10:26
+   |
+10 |     let _: AuthContext = Default::default();
+   |                          ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `AuthContext`

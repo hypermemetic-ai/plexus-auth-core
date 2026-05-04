@@ -1,0 +1,13 @@
+error[E0451]: fields `user_id`, `issuer`, `issued_at` and `expires_at` of struct `VerifiedUser` are private
+  --> tests/compile_fail/verified_user_field_access.rs:10:9
+   |
+ 9 |     let _ = VerifiedUser {
+   |             ------------ in this type
+10 |         user_id: "alice".to_string(),
+   |         ^^^^^^^ private field
+11 |         issuer: "x".to_string(),
+   |         ^^^^^^ private field
+12 |         issued_at: 0,
+   |         ^^^^^^^^^ private field
+13 |         expires_at: 0,
+   |         ^^^^^^^^^^ private field

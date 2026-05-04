@@ -1,0 +1,44 @@
+//! Acceptance tests for the sealed-type guarantees that AUTHZ-CORE-CRATE-1
+//! demands. Each `tests/compile_fail/*.rs` file is a small program that
+//! attempts to construct a sealed value from outside `plexus-auth-core`.
+//! `trybuild` runs the compiler against each one and asserts it FAILS to
+//! compile — that compile failure is the structural defense.
+//!
+//! Per the ticket §"Acceptance criteria":
+//!
+//!   6. A new test in `plexus-auth-core/tests/` asserts that `AuthContext`
+//!      cannot be constructed from outside the crate (intentionally
+//!      compile-fails using `trybuild` or equivalent).
+//!
+//!   7. A new test asserts no `Default` impl exists on `AuthContext`
+//!      (compile-fail or `static_assertions`).
+//!
+//! The compile-fail programs cover:
+//!
+//!   - VerifiedUser cannot be constructed externally (private constructor +
+//!     private fields)
+//!   - Principal cannot be constructed externally (all variants gated)
+//!   - ServiceIdentity cannot be constructed externally
+//!   - VerifiedUser does not implement Default
+//!   - Principal does not implement Default
+//!
+//! AuthContext currently retains its `pub` constructor and `pub` fields
+//! (see RUN-NOTES). The full external-construction lockdown for
+//! AuthContext lands in a follow-up ticket once call sites are migrated.
+//! In the meantime, the protections that DO hold today for AuthContext
+//! are also asserted: no Default impl, and the orphan-rule guarantee
+//! (which is a property of Rust's coherence rules, not of an attribute on
+//! the type — captured here by inspection in the architecture doc).
+
+#[test]
+fn sealing_compile_fails() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/verified_user_construct.rs");
+    t.compile_fail("tests/compile_fail/verified_user_field_access.rs");
+    t.compile_fail("tests/compile_fail/principal_user_construct.rs");
+    t.compile_fail("tests/compile_fail/principal_anonymous_construct.rs");
+    t.compile_fail("tests/compile_fail/service_identity_construct.rs");
+    t.compile_fail("tests/compile_fail/verified_user_no_default.rs");
+    t.compile_fail("tests/compile_fail/principal_no_default.rs");
+    t.compile_fail("tests/compile_fail/auth_context_no_default.rs");
+}

@@ -1,0 +1,10 @@
+error[E0624]: associated function `new_sealed` is private
+ --> tests/compile_fail/service_identity_construct.rs:8:30
+  |
+8 |     let _ = ServiceIdentity::new_sealed("plexus.example".into());
+  |                              ^^^^^^^^^^ private associated function
+  |
+ ::: src/principal.rs
+  |
+  |     pub(crate) fn new_sealed(service_id: String) -> Self {
+  |     ---------------------------------------------------- private associated function defined here

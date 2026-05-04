@@ -1,0 +1,10 @@
+error[E0624]: associated function `anonymous_sealed` is private
+  --> tests/compile_fail/principal_anonymous_construct.rs:14:24
+   |
+14 |     let _ = Principal::anonymous_sealed();
+   |                        ^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/principal.rs
+   |
+   |     pub(crate) fn anonymous_sealed() -> Self {
+   |     ---------------------------------------- private associated function defined here

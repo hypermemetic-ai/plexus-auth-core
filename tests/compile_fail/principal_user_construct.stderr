@@ -1,0 +1,15 @@
+error[E0624]: associated function `new_sealed` is private
+  --> tests/compile_fail/principal_user_construct.rs:10:27
+   |
+10 |       let v = VerifiedUser::new_sealed("alice".into(), "i".into(), 0, 0);
+   |                             ^^^^^^^^^^ private associated function
+   |
+  ::: src/verified_user.rs
+   |
+   | /     pub(crate) fn new_sealed(
+   | |         user_id: String,
+   | |         issuer: String,
+   | |         issued_at: i64,
+   | |         expires_at: i64,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
