@@ -1,0 +1,5 @@
+error[E0451]: field `_seal` of struct `plexus_auth_core::TenantBoundary` is private
+  --> tests/compile_fail/tenant_boundary_struct_literal.rs:11:30
+   |
+11 |     let _ = TenantBoundary { _seal: () };
+   |                              ^^^^^ private field

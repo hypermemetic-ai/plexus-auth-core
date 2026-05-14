@@ -1,0 +1,5 @@
+error[E0616]: field `inner` of struct `Tenanted` is private
+  --> tests/compile_fail/tenanted_inner_field.rs:12:21
+   |
+12 |     let _inner = &t.inner;
+   |                     ^^^^^ private field

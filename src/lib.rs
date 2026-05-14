@@ -107,5 +107,8 @@ pub use forward::{
     PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
 };
 pub use principal::{Principal, ServiceIdentity};
-pub use tenant::{ClaimTenantResolver, SingleTenantResolver, Tenant, TenantError, TenantResolver};
+pub use tenant::{
+    ClaimTenantResolver, Scoped, SingleTenantResolver, Tenant, TenantBoundary, TenantError,
+    TenantResolver, TenantScopedStore, Tenanted,
+};
 pub use verified_user::VerifiedUser;

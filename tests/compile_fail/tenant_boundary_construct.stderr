@@ -1,0 +1,10 @@
+error[E0624]: associated function `new_sealed` is private
+  --> tests/compile_fail/tenant_boundary_construct.rs:13:29
+   |
+13 |     let _ = TenantBoundary::new_sealed();
+   |                             ^^^^^^^^^^ private associated function
+   |
+  ::: src/tenant/storage.rs
+   |
+   |     pub(crate) const fn new_sealed() -> Self {
+   |     ---------------------------------------- private associated function defined here
