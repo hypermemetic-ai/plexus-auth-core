@@ -151,11 +151,6 @@ impl AuthContext {
     /// [`ForwardDerivation`]: crate::forward::ForwardDerivation
     /// [`ForwardPolicy`]: crate::forward::ForwardPolicy
     ///
-    /// `dead_code` is allowed because the only caller — the plexus-core
-    /// `route_to_child` dispatch path — lands in AUTHLANG-3. The
-    /// constructor must exist now so the trybuild compile-fail asserts
-    /// (downstream crates cannot reach it) are meaningful.
-    #[allow(dead_code)]
     pub(crate) fn derive_callee_context(
         caller_ctx: &AuthContext,
         derivation: &crate::forward::ForwardDerivation,
@@ -185,6 +180,40 @@ impl AuthContext {
             roles,
             metadata,
         }
+    }
+
+    /// Scoped-callback API for deriving a callee context.
+    ///
+    /// The framework's dispatch path (plexus-core `route_to_child`) calls
+    /// this with a `ForwardDerivation` and a caller-principal stamp; the
+    /// closure receives the derived callee `AuthContext` by value and
+    /// returns whatever the dispatch yields (typically a `Future`).
+    /// Passing by value rather than reference is intentional: it allows
+    /// the closure to move the callee into an async block so dispatch can
+    /// await the child call while the callee lives inside the future's
+    /// state machine.
+    ///
+    /// This is the public entry point for AUTHLANG-3. The underlying
+    /// constructor [`derive_callee_context`] remains `pub(crate)` so the
+    /// raw "mint a callee from a caller" symbol is not callable from
+    /// outside `plexus-auth-core`. Anyone can still call `AuthContext::new`
+    /// and craft their own context from scratch — what they cannot do is
+    /// obtain one through the framework-blessed derivation path except
+    /// inside this callback, where the lifetime is scoped to the dispatch
+    /// invocation.
+    ///
+    /// Per AUTHZ-0 §"The sealed-type pattern": the policy proposes (via
+    /// `ForwardDerivation`); the framework disposes (via this callback).
+    pub fn with_callee_context<F, R>(
+        &self,
+        derivation: &crate::forward::ForwardDerivation,
+        immediate_caller_stamp: &crate::principal::Principal,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(AuthContext) -> R,
+    {
+        f(Self::derive_callee_context(self, derivation, immediate_caller_stamp))
     }
 }
 
@@ -409,6 +438,41 @@ mod tests {
         assert!(callee.roles.is_empty());
         assert_eq!(callee.metadata, Value::Null);
         assert!(!callee.is_authenticated());
+    }
+
+    #[test]
+    fn with_callee_context_invokes_closure_with_derived_callee() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let caller = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec!["admin".to_string()],
+            serde_json::json!({"tenant_id": "org-1"}),
+        );
+        let stamp = Principal::anonymous_sealed();
+
+        let observed_user_id =
+            caller.with_callee_context(&ForwardDerivation::IDENTITY_ONLY, &stamp, |callee| {
+                assert!(callee.roles.is_empty());
+                assert_eq!(callee.metadata, Value::Null);
+                callee.user_id
+            });
+
+        assert_eq!(observed_user_id, "alice");
+    }
+
+    #[test]
+    fn with_callee_context_returns_closure_value() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let caller = AuthContext::anonymous();
+        let stamp = Principal::anonymous_sealed();
+        let answer =
+            caller.with_callee_context(&ForwardDerivation::PASS_THROUGH, &stamp, |_| 42_u32);
+        assert_eq!(answer, 42);
     }
 
     #[test]
