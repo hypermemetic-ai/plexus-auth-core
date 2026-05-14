@@ -97,10 +97,13 @@ pub use capabilities::{
     CookieName, CookieNameError, HeaderName, HeaderNameError, IssuerUrl, IssuerUrlError,
     MethodPath, MethodPathError,
 };
+#[allow(deprecated)]
+pub use credential::CredentialsRegistry;
 pub use credential::{
     AttachmentSite, CapturedCredential, Credential, CredentialFieldMarker, CredentialId,
     CredentialIssuer, CredentialKind, CredentialKindName, CredentialMetadata, CredentialMinter,
-    CredentialScheme, DispatchSidecar, Origin, ParamName, Scope,
+    CredentialScheme, CredentialsRegistryFallback, CredentialsRegistryProbe, DispatchSidecar,
+    HasCredentialMarkers, Origin, ParamName, Scope,
 };
 pub use forward::{
     Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,

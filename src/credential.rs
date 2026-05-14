@@ -1002,6 +1002,142 @@ impl CredentialFieldMarker {
 }
 
 // ---------------------------------------------------------------------------
+// CredentialsRegistry — autoref-specialized marker-slice dispatch wiring the
+// macro-emitted credential registry to consumer codegen (AUTHZ-CRED-MACRO-3).
+// ---------------------------------------------------------------------------
+
+/// Trait that types deriving `#[derive(plexus_macros::Credentials)]` opt into
+/// by providing their static credential-marker slice.
+///
+/// Consumers do not implement this trait by hand; the
+/// `#[derive(plexus_macros::Credentials)]` macro emits the impl with the
+/// populated `credential_markers()` body. Types that do NOT derive
+/// `Credentials` do not implement this trait at all — instead, the
+/// `#[plexus_macros::activation]` call site dispatches to the blanket
+/// fallback [`CredentialsRegistryFallback`] which returns an empty slice.
+///
+/// # Why a separate marker trait?
+///
+/// The autoref-specialization trick (see [`CredentialsRegistryProbe`])
+/// uses TWO impls on `CredentialsRegistryProbe<T>`:
+///
+/// 1. An inherent impl gated on `T: HasCredentialMarkers` — populated path.
+/// 2. A trait impl on `&CredentialsRegistryProbe<T>` — empty fallback path.
+///
+/// Inherent impls are constrained to the type's home crate (orphan rule
+/// E0116); the user's `#[derive(Credentials)]` cannot write
+/// `impl CredentialsRegistryProbe<UserType>` because `CredentialsRegistryProbe`
+/// lives in `plexus_auth_core`. The marker trait sidesteps this: the user's
+/// derive emits a normal trait impl `impl HasCredentialMarkers for UserType`
+/// (orphan-allowed), and `plexus_auth_core`'s generic inherent impl
+/// `impl<T: HasCredentialMarkers> CredentialsRegistryProbe<T>` does the
+/// dispatch.
+pub trait HasCredentialMarkers {
+    /// Return the static slice of credential-field markers for this type.
+    /// Emitted by the `#[derive(Credentials)]` macro; not implemented by
+    /// hand.
+    fn credential_markers() -> &'static [CredentialFieldMarker];
+}
+
+/// Type-erased "probe" used by the autoref-specialization trick to dispatch
+/// to either the populated marker slice (when `T: HasCredentialMarkers`) or
+/// the empty fallback (otherwise).
+///
+/// Consumers do not construct this directly; the `#[plexus_macros::method]`
+/// codegen emits the call site
+/// `(&CredentialsRegistryProbe::<ReturnType>::new()).marker_slice()`. Rust's
+/// method-resolution rules prefer inherent methods over trait methods, so
+/// the inherent `marker_slice` on `CredentialsRegistryProbe<T>` (gated on
+/// `T: HasCredentialMarkers`) wins when the return type derives
+/// `Credentials`. Otherwise autoref kicks in and the trait method on
+/// `&CredentialsRegistryProbe<T>` provides the empty-slice fallback.
+///
+/// # Why autoref-specialization?
+///
+/// The straightforward shape — a trait `CredentialsRegistry` with a default
+/// `marker_slice()` method — requires either (a) a blanket `impl<T>` (which
+/// then cannot be overridden by the derive without nightly specialization),
+/// or (b) every consumer type explicitly implementing the trait (which would
+/// be a breaking change for the entire workspace). The probe-with-autoref
+/// pattern preserves stable Rust, requires zero opt-in from non-deriving
+/// types, and lets the macro emit a normal trait impl (orphan-allowed) on
+/// the user's type to drive the specialized inherent path.
+///
+/// See `plans/AUTHZ/AUTHZ-CRED-MACRO-3-RUN-NOTES.md` for the design rationale
+/// and alternatives considered.
+#[doc(hidden)]
+pub struct CredentialsRegistryProbe<T: ?Sized>(::core::marker::PhantomData<fn() -> T>);
+
+impl<T: ?Sized> CredentialsRegistryProbe<T> {
+    /// Construct a fresh probe value. Free of runtime cost — the inner
+    /// `PhantomData` carries no data, only the type parameter.
+    #[doc(hidden)]
+    pub const fn new() -> Self {
+        Self(::core::marker::PhantomData)
+    }
+}
+
+impl<T: ?Sized> Default for CredentialsRegistryProbe<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Specialized inherent path: when `T: HasCredentialMarkers`, the probe
+/// exposes the populated marker slice via `T::credential_markers()`.
+/// Rust prefers this inherent method over the trait method from the
+/// fallback impl, so types that derive `Credentials` always hit this path.
+impl<T: HasCredentialMarkers + ?Sized> CredentialsRegistryProbe<T> {
+    /// Forward to `T::credential_markers()`. The probe call site never
+    /// names this method directly; macro-emitted code at the activation
+    /// site calls `(&probe).marker_slice()`, and autoref-resolution picks
+    /// this inherent method over the trait fallback.
+    #[doc(hidden)]
+    pub fn marker_slice(&self) -> &'static [CredentialFieldMarker] {
+        T::credential_markers()
+    }
+}
+
+/// Fallback path: when `T` does NOT implement `HasCredentialMarkers`, the
+/// inherent `marker_slice` doesn't apply, autoref kicks in, and the
+/// reference-typed trait impl below supplies the empty-slice default.
+///
+/// Consumers do not name this trait; the `#[plexus_macros::activation]`
+/// codegen brings it into scope via a `use` declaration inside the
+/// macro-generated `compute_method_schemas` body, so the same call site
+/// (`(&probe).marker_slice()`) works whether the return type derives
+/// `Credentials` or not.
+pub trait CredentialsRegistryFallback {
+    /// Empty-slice fallback. Pre-AUTHZ-CRED-MACRO-3 behavior — every
+    /// method's `MethodSchema.credentials` was `[]`; the fallback preserves
+    /// that for types that don't derive `Credentials`.
+    fn marker_slice(&self) -> &'static [CredentialFieldMarker] {
+        &[]
+    }
+}
+
+// Blanket impl on `&CredentialsRegistryProbe<T>` — autoref lands here for
+// types that don't have the `HasCredentialMarkers` inherent path.
+impl<T: ?Sized> CredentialsRegistryFallback for &CredentialsRegistryProbe<T> {}
+
+/// Deprecated alias kept while consumers migrate to the new
+/// [`CredentialsRegistryFallback`] name.
+///
+/// The original AUTHZ-CRED-MACRO-3 trait shape was named
+/// `CredentialsRegistry`; renaming it to
+/// [`CredentialsRegistryFallback`] makes the trait's role at the call site
+/// (fallback path only) explicit. This alias preserves call sites that
+/// already wrote `use plexus_auth_core::CredentialsRegistry`.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use `CredentialsRegistryFallback` instead (renamed for clarity)."
+)]
+pub trait CredentialsRegistry: CredentialsRegistryFallback {}
+
+#[allow(deprecated)]
+impl<T: CredentialsRegistryFallback + ?Sized> CredentialsRegistry for T {}
+
+// ---------------------------------------------------------------------------
 // Unit tests.
 // ---------------------------------------------------------------------------
 
@@ -1596,5 +1732,109 @@ mod tests {
         assert_eq!(metadata.kind, CredentialKind::Bearer);
         assert_eq!(metadata.issuer, issuer);
         assert!(metadata.sensitive, "always true per CredentialMetadata::new");
+    }
+
+    // -----------------------------------------------------------------------
+    // CredentialsRegistry — autoref-specialized fallback tests
+    // (AUTHZ-CRED-MACRO-3).
+    // -----------------------------------------------------------------------
+
+    /// Types that do NOT implement [`HasCredentialMarkers`] fall through to
+    /// the [`CredentialsRegistryFallback`] blanket impl, which returns an
+    /// empty slice. This is the "plain return type" path at the
+    /// `#[plexus_macros::method]` call site.
+    #[test]
+    fn credentials_registry_fallback_returns_empty_slice() {
+        // Bring the fallback trait into scope so its `marker_slice`
+        // is callable via autoref — this mirrors what the macro emits.
+        use super::CredentialsRegistryFallback as _;
+
+        struct PlainType;
+        let probe = CredentialsRegistryProbe::<PlainType>::new();
+        // Autoref: `&probe` resolves to the fallback impl on
+        // `&CredentialsRegistryProbe<T>`.
+        let markers: &'static [CredentialFieldMarker] = (&probe).marker_slice();
+        assert!(markers.is_empty(), "plain type yields empty marker slice");
+    }
+
+    /// The probe is constructible for arbitrary types, including types that
+    /// are not `Sized` and types that come from other crates. Smoke-checks
+    /// `CredentialsRegistryProbe::new()` is `const`.
+    #[test]
+    fn credentials_registry_probe_constructible_for_arbitrary_types() {
+        let _: CredentialsRegistryProbe<String> = CredentialsRegistryProbe::new();
+        let _: CredentialsRegistryProbe<Vec<u8>> = CredentialsRegistryProbe::new();
+        // `const` smoke-check.
+        const _: CredentialsRegistryProbe<()> = CredentialsRegistryProbe::new();
+    }
+
+    /// Types that implement [`HasCredentialMarkers`] hit the specialized
+    /// inherent `marker_slice` on `CredentialsRegistryProbe<T>` — the
+    /// "wired return type" path at the `#[plexus_macros::method]` call site.
+    /// Demonstrates the autoref-specialization win.
+    #[test]
+    fn credentials_registry_specialized_path_returns_populated_slice() {
+        use super::CredentialsRegistryFallback as _;
+
+        struct WiredType;
+
+        // Lazy static slice, mirroring what the derive macro will emit via
+        // `OnceLock::get_or_init(|| credential_markers_for_<Type>())`.
+        impl HasCredentialMarkers for WiredType {
+            fn credential_markers() -> &'static [CredentialFieldMarker] {
+                use std::sync::OnceLock;
+                static M: OnceLock<Vec<CredentialFieldMarker>> = OnceLock::new();
+                M.get_or_init(|| {
+                    vec![CredentialFieldMarker::new(
+                        None,
+                        "session",
+                        CredentialKind::Bearer,
+                        AttachmentSite::Header {
+                            name: HeaderName::try_new("authorization").unwrap(),
+                        },
+                        Some(CredentialScheme::new("Bearer ")),
+                        vec![],
+                        None,
+                        None,
+                    )]
+                })
+                .as_slice()
+            }
+        }
+
+        let probe = CredentialsRegistryProbe::<WiredType>::new();
+
+        // Direct call on the probe (no autoref): the inherent method gated
+        // on `T: HasCredentialMarkers` resolves first.
+        let m = probe.marker_slice();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].field, "session");
+        assert!(matches!(m[0].kind, CredentialKind::Bearer));
+
+        // Same call with leading `&`: autoref-resolution still prefers the
+        // inherent (gated) method over the `&CredentialsRegistryProbe<T>`
+        // fallback impl. This is the actual call shape used by the macro.
+        let m2 = (&probe).marker_slice();
+        assert_eq!(
+            m2.len(),
+            1,
+            "inherent specialized path wins over blanket fallback via autoref"
+        );
+        assert_eq!(m2[0].field, "session");
+    }
+
+    /// Sanity-check the deprecated alias `CredentialsRegistry` still works
+    /// for back-compat with any in-flight call sites that used the original
+    /// name.
+    #[test]
+    #[allow(deprecated)]
+    fn credentials_registry_deprecated_alias_compiles() {
+        struct PlainType;
+        let probe = CredentialsRegistryProbe::<PlainType>::new();
+        // Bring the deprecated alias into scope. The supertrait relationship
+        // (alias: Fallback) means autoref still finds the empty-slice path.
+        use super::CredentialsRegistry as _;
+        let markers = (&probe).marker_slice();
+        assert!(markers.is_empty());
     }
 }
