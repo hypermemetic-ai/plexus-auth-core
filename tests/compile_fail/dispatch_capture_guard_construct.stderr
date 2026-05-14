@@ -1,0 +1,10 @@
+error[E0624]: associated function `install` is private
+  --> tests/compile_fail/dispatch_capture_guard_construct.rs:10:65
+   |
+10 |     let _ = plexus_auth_core::credential::DispatchCaptureGuard::install();
+   |                                                                 ^^^^^^^ private associated function
+   |
+  ::: src/credential.rs
+   |
+   |     pub(crate) fn install() -> Self {
+   |     ------------------------------- private associated function defined here

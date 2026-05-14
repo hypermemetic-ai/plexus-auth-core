@@ -32,6 +32,20 @@
 //! are also asserted: no Default impl, and the orphan-rule guarantee
 //! (which is a property of Rust's coherence rules, not of an attribute on
 //! the type — captured here by inspection in the architecture doc).
+//!
+//! AUTHZ-CRED-CORE-1 adds compile-fail asserts for the credential
+//! primitive (acceptance criteria 6, 7, 8 plus §"Forbidden constructions"
+//! and the Tier B Q-WIRE-3 dispatch-capture guard):
+//!
+//!   - `Credential::new_sealed` is unreachable externally
+//!   - `Credential { .. }` struct-literal construction is unreachable
+//!   - `Credential<T>` does not implement `Default`
+//!   - `CredentialMinter::new_sealed` is unreachable externally
+//!   - `impl From<X> for Credential<T>` from a third crate is rejected by
+//!     Rust's orphan rule (acceptance criterion 8)
+//!   - `Credential<T>` is not `Deserialize` (raw JSON cannot fabricate one)
+//!   - `DispatchCaptureGuard::install` is unreachable externally (so the
+//!     dispatch-side capture toggle cannot be activated by activation code)
 
 #[test]
 fn sealing_compile_fails() {
@@ -47,4 +61,15 @@ fn sealing_compile_fails() {
     t.compile_fail("tests/compile_fail/tenant_construct.rs");
     t.compile_fail("tests/compile_fail/tenant_field_access.rs");
     t.compile_fail("tests/compile_fail/tenant_no_default.rs");
+
+    // AUTHZ-CRED-CORE-1 acceptance criteria 6, 7, 8 (and the broader
+    // sealed-construction asserts called out in §"Forbidden constructions"
+    // and Tier B Q-WIRE-3).
+    t.compile_fail("tests/compile_fail/credential_construct.rs");
+    t.compile_fail("tests/compile_fail/credential_struct_literal.rs");
+    t.compile_fail("tests/compile_fail/credential_no_default.rs");
+    t.compile_fail("tests/compile_fail/credential_minter_construct.rs");
+    t.compile_fail("tests/compile_fail/credential_orphan_from.rs");
+    t.compile_fail("tests/compile_fail/credential_no_deserialize.rs");
+    t.compile_fail("tests/compile_fail/dispatch_capture_guard_construct.rs");
 }

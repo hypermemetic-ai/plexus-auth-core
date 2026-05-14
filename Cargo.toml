@@ -35,8 +35,10 @@ path = "src/lib.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Schema generation, for IR/codegen integration.
-schemars = { version = "1.1", features = ["derive"] }
+# Schema generation, for IR/codegen integration. `chrono04` so the
+# `CredentialMetadata::expires_at` field's `DateTime<Utc>` participates in
+# `JsonSchema` derivation.
+schemars = { version = "1.1", features = ["derive", "chrono04"] }
 
 # Async-trait so the SessionValidator-shaped traits can live here in the future.
 async-trait = "0.1"
@@ -45,6 +47,12 @@ async-trait = "0.1"
 # `IssuerUrl(url::Url)` for the capability-advertisement type set landed in
 # AUTHZ-CORE-3.
 url = { version = "2", features = ["serde"] }
+
+# Timestamps on credential metadata (expires_at). AUTHZ-CRED-S01-output §2 pins
+# `Option<DateTime<Utc>>`; the workspace's canonical timestamp type is
+# chrono::DateTime<Utc> (see plexus-core/Cargo.toml). Used by
+# `CredentialMetadata::expires_at` in `src/credential.rs`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
