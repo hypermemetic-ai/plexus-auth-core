@@ -54,8 +54,25 @@ url = { version = "2", features = ["serde"] }
 # `CredentialMetadata::expires_at` in `src/credential.rs`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
+# AUTHZ-PRIVACY-1: `AuditRecord::correlation_id` is a UUID (per
+# AUTHZ-S01-output §8). Workspace canonical version is 1.x; we pull `v4` for
+# generation and `serde` for round-trip.
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# AUTHZ-PRIVACY-1: `TracingAuditSink` emits structured `tracing::info!` events
+# under `target = "plexus::audit"` so every backend gets observability for
+# free (AUTHZ-S01-output §8). Workspace pins `tracing = "0.1"`.
+tracing = "0.1"
+
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
 # Principal cannot be constructed from outside this crate.
 trybuild = "1.0"
 tokio = { version = "1", features = ["macros", "rt"] }
+
+# AUTHZ-PRIVACY-1: assert `TracingAuditSink` emits to the `plexus::audit`
+# target. `tracing-test` captures span/event output for in-test assertions.
+# `no-env-filter` is required because our events use `target = "plexus::audit"`
+# (a logical target), not the crate-derived target tracing-test filters on
+# by default.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

@@ -45,6 +45,12 @@
 //! - [`CredentialMetadata`] — typed contract describing what the credential
 //!   is and how to attach it on subsequent calls (kind, attach site, scheme,
 //!   scopes, expiry, refresh/revoke hints, issuer, sensitivity).
+//! - [`AuditRecord`] — the audit primitive consumed by AUTHZ default-deny
+//!   dispatch (AUTHZ-CORE-5) and AUTHLANG-3's forwarding-policy path. Carries
+//!   the principal chain, decision, reason, latency, and correlation ID for
+//!   one scope check. [`AuditSink`] is the framework's persistence trait;
+//!   [`TracingAuditSink`] is the default impl emitting `tracing::info!`
+//!   events under `target = "plexus::audit"`.
 //!
 //! # Sealing protections (per AUTHZ-0)
 //!
@@ -71,6 +77,7 @@
 //! `AuthContext` seal to match `VerifiedUser`/`Principal` is the next step
 //! in the auth track and lands as a follow-up ticket.
 
+pub mod audit;
 pub mod auth;
 pub mod capabilities;
 pub mod credential;
@@ -80,6 +87,10 @@ pub mod verified_user;
 
 pub mod forward;
 
+pub use audit::{
+    AuditDecision, AuditDenyReason, AuditRecord, AuditRecordKind, AuditSink, ForwardPolicyApplied,
+    RoleName, ScopeCheck, SensitiveField, SessionId, TracingAuditSink, UserId,
+};
 pub use auth::{AuthContext, SessionValidator};
 pub use capabilities::{
     AuthMechanism, BackendAuthCapabilities, BackendAuthCapabilitiesError, ClientId, ClientIdError,
