@@ -78,6 +78,8 @@ pub mod principal;
 pub mod tenant;
 pub mod verified_user;
 
+pub mod forward;
+
 pub use auth::{AuthContext, SessionValidator};
 pub use capabilities::{
     AuthMechanism, BackendAuthCapabilities, BackendAuthCapabilitiesError, ClientId, ClientIdError,
@@ -88,6 +90,10 @@ pub use credential::{
     AttachmentSite, CapturedCredential, Credential, CredentialId, CredentialIssuer,
     CredentialKind, CredentialKindName, CredentialMetadata, CredentialMinter, CredentialScheme,
     DispatchSidecar, Origin, ParamName, Scope,
+};
+pub use forward::{
+    Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,
+    PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
 };
 pub use principal::{Principal, ServiceIdentity};
 pub use tenant::{ClaimTenantResolver, SingleTenantResolver, Tenant, TenantError, TenantResolver};
