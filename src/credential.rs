@@ -466,11 +466,22 @@ impl<T> Credential<T> {
 /// The shape of a credential captured into the dispatch-side sidecar.
 ///
 /// `value` holds the JSON-encoded inner credential payload; `metadata` rides
-/// alongside. Only emitted into the sidecar when the dispatch capture toggle
-/// is active; otherwise the credential's `Serialize` impl emits only the
-/// sentinel.
-#[derive(Debug)]
+/// alongside; `id` is the stable per-credential identifier matching the
+/// `{"$credential": "<id>"}` sentinel emitted inline in the body. Only
+/// emitted into the sidecar when the dispatch capture toggle is active;
+/// otherwise the credential's `Serialize` impl emits only the sentinel.
+///
+/// The `id` field carries the same `CredentialId` that the sidecar's
+/// internal `HashMap` uses as its key. It is duplicated onto the
+/// `CapturedCredential` itself so the public scoped-callback API
+/// ([`run_with_credential_capture`]) can return a `Vec<CapturedCredential>`
+/// that is self-describing — callers do not need to track the id
+/// separately.
+#[derive(Debug, Clone)]
 pub struct CapturedCredential {
+    /// Stable per-credential id matching the `{"$credential": "<id>"}`
+    /// sentinel emitted inline.
+    pub id: CredentialId,
     /// JSON-encoded inner value. Stored as `serde_json::Value` so the
     /// dispatch wrapper can re-emit it in the envelope without re-serializing
     /// the typed value through a second pass.
@@ -610,6 +621,78 @@ where
     (out, captured)
 }
 
+/// Public scoped-callback entry point for dispatch-time credential capture.
+///
+/// Mirrors the AUTHLANG-3 [`crate::auth::AuthContext::with_callee_context`]
+/// pattern: the framework operation (installing the
+/// [`DispatchCaptureGuard`]) is exposed to other crates ONLY for the
+/// duration of a caller-supplied closure. External callers cannot retain
+/// the guard past the function return — the seal property is "the guard's
+/// lifetime is bounded by the function call."
+///
+/// # Behavior
+///
+/// 1. Installs a fresh [`DispatchCaptureGuard`] on the current thread.
+/// 2. Runs `f`.
+/// 3. Drains the captured credentials from the guard's sidecar.
+/// 4. Drops the guard (restoring any previously-installed sidecar).
+/// 5. Returns `(f_output, Vec<CapturedCredential>)`.
+///
+/// Each returned [`CapturedCredential`] carries its own [`CredentialId`]
+/// matching the `{"$credential": "<id>"}` sentinel emitted inline in the
+/// serialized body, so the caller can correlate sidecar entries with
+/// sentinels without tracking a side map.
+///
+/// # Nested invocations
+///
+/// Nested calls to `run_with_credential_capture` install a fresh inner
+/// sidecar; inner credentials drain to the inner caller and the outer
+/// continues with its own (still-pending) sidecar after the inner
+/// returns. The two sidecars never interleave — the [`DispatchCaptureGuard`]'s
+/// `Drop` impl restores the previously-installed sidecar.
+///
+/// # Panic safety
+///
+/// If `f` panics, the guard's `Drop` impl clears the thread-local on
+/// unwind so a subsequent reentrant call observes a clean state. The
+/// partial sidecar is not delivered to the caller — capture is
+/// all-or-nothing per envelope by design.
+///
+/// # Sync-only (v1)
+///
+/// `f` is a synchronous `FnOnce`. If `f` returns a `Future`, the future
+/// executes AFTER the guard is dropped — credentials minted inside an
+/// awaited continuation are not captured. CRED-CORE-2's dispatch wrapper
+/// serializes synchronously into a buffer, so the synchronous shape
+/// suffices for v1. An async-aware variant (`run_with_credential_capture_async`)
+/// can land in a follow-up if a dispatch path needs awaiting inside the
+/// capture scope.
+///
+/// # Why scoped-callback, not a `pub install`?
+///
+/// Per AUTHZ-0 §"Sealed-type pattern": the policy proposes; the framework
+/// disposes. Exposing a raw `pub fn install() -> DispatchCaptureGuard`
+/// would let activation code retain a guard for an unbounded lifetime
+/// and observe credentials minted by unrelated framework code on the
+/// same thread. The scoped-callback shape pins the guard's lifetime to
+/// the closure, which is the actual seal property we need.
+///
+/// See `plans/AUTHZ/AUTHZ-CRED-CORE-1B.md` for the design rationale.
+pub fn run_with_credential_capture<F, R>(f: F) -> (R, Vec<CapturedCredential>)
+where
+    F: FnOnce() -> R,
+{
+    let guard = DispatchCaptureGuard::install();
+    let out = f();
+    let captured_map = guard.drain().unwrap_or_default();
+    drop(guard);
+    // Sort by id for deterministic ordering. Credential ids are assigned
+    // by an atomic counter in mint order, so this is also mint order.
+    let mut captured: Vec<CapturedCredential> = captured_map.into_values().collect();
+    captured.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    (out, captured)
+}
+
 impl<T> Serialize for Credential<T>
 where
     T: Serialize,
@@ -648,6 +731,7 @@ where
                 sidecar.map.insert(
                     self.id.clone(),
                     CapturedCredential {
+                        id: self.id.clone(),
                         value,
                         metadata: self.metadata.clone(),
                     },
@@ -700,6 +784,23 @@ impl CredentialMinter {
     /// compile-fail tests have something to point at.
     #[allow(dead_code)]
     pub(crate) fn new_sealed(default_issuer: CredentialIssuer) -> Self {
+        Self { default_issuer }
+    }
+
+    /// Test-only constructor exposed under the `test-support` feature.
+    ///
+    /// Production builds never see this method — the `test-support`
+    /// feature is documented as a `dev-dependency`-only flag (see
+    /// `Cargo.toml`). The `#[doc(hidden)]` attribute keeps it out of
+    /// rustdoc so the public API surface still reads as
+    /// "no constructor reachable from outside the crate."
+    ///
+    /// Added by AUTHZ-CRED-CORE-1B so plexus-core can write end-to-end
+    /// tests of the dispatch-time credential interception path that
+    /// require minting a real `Credential<T>`.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_for_test(default_issuer: CredentialIssuer) -> Self {
         Self { default_issuer }
     }
 
@@ -1065,6 +1166,193 @@ mod tests {
             entry.value,
             serde_json::Value::String("oauth-access".into())
         );
+    }
+
+    // -----------------------------------------------------------------
+    // AUTHZ-CRED-CORE-1B: scoped-callback public entry point.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn run_with_credential_capture_empty_returns_no_captures() {
+        // Acceptance criterion 2 (empty case): `f` produces no
+        // `Credential<T>` values; the returned Vec is empty and the
+        // closure's output is propagated.
+        let (out, captured) = run_with_credential_capture(|| {
+            // Serialize a plain payload that contains no credentials.
+            let v = serde_json::to_value(serde_json::json!({"x": 1})).unwrap();
+            v
+        });
+        assert_eq!(out, serde_json::json!({"x": 1}));
+        assert!(
+            captured.is_empty(),
+            "no credentials emitted -> empty Vec; got {captured:?}"
+        );
+    }
+
+    #[test]
+    fn run_with_credential_capture_populated_returns_real_captures() {
+        // Acceptance criterion 2 (populated case): `f` calls
+        // `Credential<T>::serialize` while the guard is installed; the
+        // returned Vec contains the captured credentials with their ids,
+        // values, and metadata. The outer serialization still produces
+        // sentinels — the value lives only in the sidecar.
+        let minter = CredentialMinter::new_sealed(sample_issuer());
+        let cred: Credential<String> =
+            minter.mint("populated-secret".to_string(), sample_metadata());
+        let cred_id = cred.id().clone();
+
+        let (json_value, captured) =
+            run_with_credential_capture(|| serde_json::to_value(&cred).expect("serialize"));
+
+        // Outer JSON: sentinel-only.
+        let obj = json_value.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            obj.get("$credential").and_then(|v| v.as_str()),
+            Some(cred_id.as_str())
+        );
+
+        // Sidecar Vec: one entry, value+metadata+id present.
+        assert_eq!(captured.len(), 1);
+        let entry = &captured[0];
+        assert_eq!(entry.id, cred_id);
+        assert_eq!(
+            entry.value,
+            serde_json::Value::String("populated-secret".into())
+        );
+        assert_eq!(entry.metadata.kind, CredentialKind::Bearer);
+    }
+
+    #[test]
+    fn run_with_credential_capture_nested_sidecars_do_not_interleave() {
+        // Ticket §Risks #1: nested invocations install fresh inner
+        // sidecars; inner captures drain to the inner caller; the outer
+        // continues with its own (still-pending) sidecar after the inner
+        // returns. The two sidecars never interleave.
+        let minter = CredentialMinter::new_sealed(sample_issuer());
+        let outer_cred: Credential<String> =
+            minter.mint("outer-secret".to_string(), sample_metadata());
+        let inner_cred: Credential<String> =
+            minter.mint("inner-secret".to_string(), sample_metadata());
+        let outer_id = outer_cred.id().clone();
+        let inner_id = inner_cred.id().clone();
+
+        let (outer_result, outer_captured) = run_with_credential_capture(|| {
+            // Serialize outer credential under the outer guard.
+            let _outer_json = serde_json::to_value(&outer_cred).expect("outer serialize");
+
+            // Now nest a fresh scope; the inner credential should be
+            // captured ONLY by the inner guard.
+            let (inner_json, inner_captured) =
+                run_with_credential_capture(|| serde_json::to_value(&inner_cred).expect("inner"));
+            assert_eq!(inner_captured.len(), 1, "inner scope captures inner only");
+            assert_eq!(inner_captured[0].id, inner_id);
+            assert_eq!(
+                inner_captured[0].value,
+                serde_json::Value::String("inner-secret".into())
+            );
+
+            // After the inner scope returns, outer captures must still
+            // include only the outer credential (the inner sidecar drained
+            // to its caller; the outer sidecar — which is now active again
+            // — still holds outer's capture).
+            (_outer_json, inner_json)
+        });
+
+        // Outer sidecar: outer credential only (the inner drained
+        // separately).
+        assert_eq!(
+            outer_captured.len(),
+            1,
+            "outer scope contains outer only; got {outer_captured:?}"
+        );
+        assert_eq!(outer_captured[0].id, outer_id);
+        assert_eq!(
+            outer_captured[0].value,
+            serde_json::Value::String("outer-secret".into())
+        );
+
+        // The closure returned both serialized values.
+        let (outer_json, inner_json) = outer_result;
+        assert_eq!(
+            outer_json.get("$credential").and_then(|v| v.as_str()),
+            Some(outer_id.as_str())
+        );
+        assert_eq!(
+            inner_json.get("$credential").and_then(|v| v.as_str()),
+            Some(inner_id.as_str())
+        );
+    }
+
+    #[test]
+    fn run_with_credential_capture_resets_on_panic() {
+        // Ticket §"Required behavior": if `f` panics, the guard's `Drop`
+        // releases the toggle on unwind; subsequent reentrant calls see
+        // a clean state.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_with_credential_capture(|| {
+                // Active sidecar.
+                DISPATCH_SIDECAR.with(|cell| assert!(cell.borrow().is_some()));
+                panic!("simulated panic inside run_with_credential_capture");
+            });
+        }));
+
+        // After the panic, the thread-local must be clean.
+        DISPATCH_SIDECAR.with(|cell| {
+            assert!(
+                cell.borrow().is_none(),
+                "sidecar must be cleared on panic"
+            );
+        });
+
+        // And a subsequent call works cleanly.
+        let (out, captured) = run_with_credential_capture(|| 7_u32);
+        assert_eq!(out, 7);
+        assert!(captured.is_empty());
+    }
+
+    #[test]
+    fn run_with_credential_capture_isolated_per_thread() {
+        // Ticket §Risks #3: the existing guard uses a thread-local;
+        // multi-threaded dispatch must isolate per-task captures. Two
+        // threads each running their own `run_with_credential_capture`
+        // see only their own credentials.
+        use std::sync::Arc;
+        use std::thread;
+
+        let minter = Arc::new(CredentialMinter::new_sealed(sample_issuer()));
+        let m1 = minter.clone();
+        let m2 = minter.clone();
+
+        let h1 = thread::spawn(move || {
+            let cred: Credential<String> =
+                m1.mint("thread-1-secret".to_string(), sample_metadata());
+            let id = cred.id().clone();
+            let (_v, captured) =
+                run_with_credential_capture(|| serde_json::to_value(&cred).unwrap());
+            (id, captured)
+        });
+        let h2 = thread::spawn(move || {
+            let cred: Credential<String> =
+                m2.mint("thread-2-secret".to_string(), sample_metadata());
+            let id = cred.id().clone();
+            let (_v, captured) =
+                run_with_credential_capture(|| serde_json::to_value(&cred).unwrap());
+            (id, captured)
+        });
+
+        let (id1, c1) = h1.join().unwrap();
+        let (id2, c2) = h2.join().unwrap();
+
+        assert_eq!(c1.len(), 1, "thread 1 captures only its own credential");
+        assert_eq!(c1[0].id, id1);
+        assert_eq!(c1[0].value, serde_json::Value::String("thread-1-secret".into()));
+
+        assert_eq!(c2.len(), 1, "thread 2 captures only its own credential");
+        assert_eq!(c2[0].id, id2);
+        assert_eq!(c2[0].value, serde_json::Value::String("thread-2-secret".into()));
+
+        assert_ne!(id1, id2);
     }
 
     #[test]

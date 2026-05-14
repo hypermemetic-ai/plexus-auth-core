@@ -29,6 +29,20 @@ license = "AGPL-3.0-only"
 name = "plexus_auth_core"
 path = "src/lib.rs"
 
+[features]
+# `test-support` exposes a small set of pub-but-doc-hidden constructors so
+# downstream crates (notably plexus-core) can write end-to-end tests that
+# need to mint real sealed values. These constructors are gated and
+# `#[doc(hidden)]`; they MUST NOT be reachable from production builds.
+# Enable via `[dev-dependencies] plexus-auth-core = { features =
+# ["test-support"] }` — never as a default feature and never in
+# `[dependencies]`.
+#
+# Added by AUTHZ-CRED-CORE-1B so plexus-core can exercise the end-to-end
+# `Credential<T>` serialization path now that
+# `run_with_credential_capture` is publicly reachable.
+test-support = []
+
 [dependencies]
 # Serialization. Note: Deserialize is intentionally implemented in a way that
 # documents the seal rather than offering a back-door. See module docs.
