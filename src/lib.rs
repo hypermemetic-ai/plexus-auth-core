@@ -98,9 +98,9 @@ pub use capabilities::{
     MethodPath, MethodPathError,
 };
 pub use credential::{
-    AttachmentSite, CapturedCredential, Credential, CredentialId, CredentialIssuer,
-    CredentialKind, CredentialKindName, CredentialMetadata, CredentialMinter, CredentialScheme,
-    DispatchSidecar, Origin, ParamName, Scope,
+    AttachmentSite, CapturedCredential, Credential, CredentialFieldMarker, CredentialId,
+    CredentialIssuer, CredentialKind, CredentialKindName, CredentialMetadata, CredentialMinter,
+    CredentialScheme, DispatchSidecar, Origin, ParamName, Scope,
 };
 pub use forward::{
     Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,
