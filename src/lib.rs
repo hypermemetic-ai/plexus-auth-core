@@ -52,6 +52,14 @@ pub mod auth;
 pub mod principal;
 pub mod verified_user;
 
+pub mod forward;
+pub mod method_path;
+
 pub use auth::{AuthContext, SessionValidator};
+pub use forward::{
+    Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,
+    PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
+};
+pub use method_path::{MethodPath, MethodPathError};
 pub use principal::{Principal, ServiceIdentity};
 pub use verified_user::VerifiedUser;

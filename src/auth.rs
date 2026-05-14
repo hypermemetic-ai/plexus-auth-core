@@ -106,6 +106,86 @@ impl AuthContext {
         self.get_metadata_string("tenant_id")
             .or_else(|| self.get_metadata_string("realm"))
     }
+
+    /// Framework-only constructor: derive a callee `AuthContext` from a
+    /// caller context and a [`ForwardDerivation`].
+    ///
+    /// This is the **only** path that mints a callee context from a
+    /// caller's. It is `pub(crate)` to `plexus-auth-core` — no downstream
+    /// crate can reach it. A [`ForwardPolicy`] impl returns a
+    /// `ForwardDerivation` (parameters); the framework dispatch path
+    /// (AUTHLANG-3 wires this into `plexus_core::route_to_child`) is the
+    /// only caller of this constructor. Per AUTHZ-0 §"The sealed-type
+    /// pattern": the policy proposes; the framework disposes.
+    ///
+    /// The `_immediate_caller_stamp` parameter is reserved for the
+    /// principal-chain extension that AUTHLANG-3 lands (it will append the
+    /// stamp to the callee's invocation chain when `AuthContext` grows the
+    /// chain field — today's `AuthContext` does not carry one, so the
+    /// parameter is bound for forward compatibility and accepted but
+    /// otherwise ignored). Surfacing it now keeps the constructor's
+    /// signature stable across the AUTHZ-0 sealed-context migration.
+    ///
+    /// # Derivation semantics
+    ///
+    /// Each flag on the derivation maps to a logical field group on the
+    /// current `AuthContext`:
+    ///
+    /// - `keep_verified_user` — retains `user_id` and `session_id` (the
+    ///   identity of the originator). When `false`, both are reset to
+    ///   `AuthContext::anonymous`'s values (`"anonymous"` / empty).
+    /// - `keep_roles` — retains the role vector. When `false`, the
+    ///   callee's `roles` is empty.
+    /// - `keep_capabilities` — reserved for the AUTHZ-DATA / AUTHZ-CRED
+    ///   migration; today's `AuthContext` carries no capabilities field, so
+    ///   this flag is a no-op. Surfacing it keeps the v1 policy shape
+    ///   forward-compatible.
+    /// - `keep_metadata` — retains the metadata bag. When `false`, the
+    ///   callee's `metadata` is `Value::Null`.
+    ///
+    /// The constructor never grows the context: every field in the
+    /// returned `AuthContext` is either copied from `caller_ctx` or reset
+    /// to the corresponding empty value. There is no path through this
+    /// function that adds an unrelated role or fabricates a user_id.
+    ///
+    /// [`ForwardDerivation`]: crate::forward::ForwardDerivation
+    /// [`ForwardPolicy`]: crate::forward::ForwardPolicy
+    ///
+    /// `dead_code` is allowed because the only caller — the plexus-core
+    /// `route_to_child` dispatch path — lands in AUTHLANG-3. The
+    /// constructor must exist now so the trybuild compile-fail asserts
+    /// (downstream crates cannot reach it) are meaningful.
+    #[allow(dead_code)]
+    pub(crate) fn derive_callee_context(
+        caller_ctx: &AuthContext,
+        derivation: &crate::forward::ForwardDerivation,
+        _immediate_caller_stamp: &crate::principal::Principal,
+    ) -> AuthContext {
+        let (user_id, session_id) = if derivation.keep_verified_user {
+            (caller_ctx.user_id.clone(), caller_ctx.session_id.clone())
+        } else {
+            ("anonymous".to_string(), String::new())
+        };
+        let roles = if derivation.keep_roles {
+            caller_ctx.roles.clone()
+        } else {
+            Vec::new()
+        };
+        // `keep_capabilities` is a no-op today: the current AuthContext has no
+        // capabilities field. The flag is preserved on `ForwardDerivation` for
+        // forward compatibility with the AUTHZ-DATA / AUTHZ-CRED migration.
+        let metadata = if derivation.keep_metadata {
+            caller_ctx.metadata.clone()
+        } else {
+            Value::Null
+        };
+        AuthContext {
+            user_id,
+            session_id,
+            roles,
+            metadata,
+        }
+    }
 }
 
 /// Backends implement this trait to validate cookies/tokens during WS upgrade.
@@ -258,6 +338,99 @@ mod tests {
             Some("user@example.com".to_string())
         );
         assert_eq!(ctx.get_metadata_string("nonexistent"), None);
+    }
+
+
+    #[test]
+    fn derive_callee_context_identity_only_strips_roles_and_metadata() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let caller = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec!["admin".to_string(), "editor".to_string()],
+            serde_json::json!({"tenant_id": "acme"}),
+        );
+        let stamp = Principal::anonymous_sealed();
+        let callee = AuthContext::derive_callee_context(
+            &caller,
+            &ForwardDerivation::IDENTITY_ONLY,
+            &stamp,
+        );
+        assert_eq!(callee.user_id, "alice");
+        assert_eq!(callee.session_id, "sess-1");
+        assert!(callee.roles.is_empty());
+        assert_eq!(callee.metadata, Value::Null);
+    }
+
+    #[test]
+    fn derive_callee_context_pass_through_retains_all_fields() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let caller = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec!["admin".to_string()],
+            serde_json::json!({"tenant_id": "acme", "k": "v"}),
+        );
+        let stamp = Principal::anonymous_sealed();
+        let callee = AuthContext::derive_callee_context(
+            &caller,
+            &ForwardDerivation::PASS_THROUGH,
+            &stamp,
+        );
+        assert_eq!(callee.user_id, caller.user_id);
+        assert_eq!(callee.session_id, caller.session_id);
+        assert_eq!(callee.roles, caller.roles);
+        assert_eq!(callee.metadata, caller.metadata);
+    }
+
+    #[test]
+    fn derive_callee_context_anonymous_drops_everything() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let caller = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec!["admin".to_string()],
+            serde_json::json!({"tenant_id": "acme"}),
+        );
+        let stamp = Principal::anonymous_sealed();
+        let callee = AuthContext::derive_callee_context(
+            &caller,
+            &ForwardDerivation::ANONYMOUS,
+            &stamp,
+        );
+        assert_eq!(callee.user_id, "anonymous");
+        assert_eq!(callee.session_id, "");
+        assert!(callee.roles.is_empty());
+        assert_eq!(callee.metadata, Value::Null);
+        assert!(!callee.is_authenticated());
+    }
+
+    #[test]
+    fn derive_callee_context_never_grows_context() {
+        // Sanity: the constructor cannot fabricate fields that did not
+        // exist on the caller. Starting from anonymous, even pass_through
+        // produces anonymous — the derivation can keep what the caller
+        // had, but never add what the caller lacked.
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let caller = AuthContext::anonymous();
+        let stamp = Principal::anonymous_sealed();
+        let callee = AuthContext::derive_callee_context(
+            &caller,
+            &ForwardDerivation::PASS_THROUGH,
+            &stamp,
+        );
+        assert_eq!(callee.user_id, "anonymous");
+        assert!(callee.roles.is_empty());
+        assert_eq!(callee.metadata, Value::Null);
+        assert!(!callee.is_authenticated());
     }
 
     #[test]

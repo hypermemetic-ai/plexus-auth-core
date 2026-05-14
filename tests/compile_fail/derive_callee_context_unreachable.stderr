@@ -1,0 +1,14 @@
+error[E0624]: associated function `derive_callee_context` is private
+  --> tests/compile_fail/derive_callee_context_unreachable.rs:21:18
+   |
+21 |       AuthContext::derive_callee_context(caller, &derivation, stamp)
+   |                    ^^^^^^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/auth.rs
+   |
+   | /     pub(crate) fn derive_callee_context(
+   | |         caller_ctx: &AuthContext,
+   | |         derivation: &crate::forward::ForwardDerivation,
+   | |         _immediate_caller_stamp: &crate::principal::Principal,
+   | |     ) -> AuthContext {
+   | |____________________- private associated function defined here

@@ -41,4 +41,9 @@ fn sealing_compile_fails() {
     t.compile_fail("tests/compile_fail/verified_user_no_default.rs");
     t.compile_fail("tests/compile_fail/principal_no_default.rs");
     t.compile_fail("tests/compile_fail/auth_context_no_default.rs");
+    // AUTHLANG-2 — the framework-only `AuthContext::derive_callee_context`
+    // constructor is `pub(crate)` to plexus-auth-core. Downstream crates
+    // cannot reach it; only the framework's dispatch path (AUTHLANG-3)
+    // can construct a callee context from a caller's.
+    t.compile_fail("tests/compile_fail/derive_callee_context_unreachable.rs");
 }
