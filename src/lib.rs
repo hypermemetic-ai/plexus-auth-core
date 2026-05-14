@@ -28,6 +28,13 @@
 //!   (`Bearer`, `Cookie`, `Oidc`, `Anonymous`) and the strong-typed
 //!   primitives [`MethodPath`], [`IssuerUrl`], [`ClientId`],
 //!   [`CookieName`], [`HeaderName`].
+//! - [`Tenant`] — sealed unit of data isolation (AUTHZ-0 layer 4). The
+//!   constructor is crate-private; the only path to a `Tenant` value is
+//!   through the framework's [`TenantResolver`].
+//! - [`TenantResolver`] — derives a `Tenant` from a verified
+//!   `AuthContext`. Reference impls: [`ClaimTenantResolver`] (the 80%
+//!   case) and [`SingleTenantResolver`] (explicit single-tenant
+//!   opt-out).
 //!
 //! # Sealing protections (per AUTHZ-0)
 //!
@@ -57,6 +64,7 @@
 pub mod auth;
 pub mod capabilities;
 pub mod principal;
+pub mod tenant;
 pub mod verified_user;
 
 pub use auth::{AuthContext, SessionValidator};
@@ -66,4 +74,5 @@ pub use capabilities::{
     MethodPath, MethodPathError,
 };
 pub use principal::{Principal, ServiceIdentity};
+pub use tenant::{ClaimTenantResolver, SingleTenantResolver, Tenant, TenantError, TenantResolver};
 pub use verified_user::VerifiedUser;
