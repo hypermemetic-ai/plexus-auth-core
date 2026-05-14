@@ -100,7 +100,8 @@ pub use capabilities::{
 pub use credential::{
     AttachmentSite, CapturedCredential, Credential, CredentialFieldMarker, CredentialId,
     CredentialIssuer, CredentialKind, CredentialKindName, CredentialMetadata, CredentialMinter,
-    CredentialScheme, DispatchSidecar, Origin, ParamName, Scope,
+    CredentialScheme, CredentialsRegistry, CredentialsRegistryProbe, DispatchSidecar, Origin,
+    ParamName, Scope,
 };
 pub use forward::{
     Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,

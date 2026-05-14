@@ -1002,6 +1002,89 @@ impl CredentialFieldMarker {
 }
 
 // ---------------------------------------------------------------------------
+// CredentialsRegistry — autoref-specialized blanket-default trait wiring the
+// macro-emitted marker registry to consumer codegen (AUTHZ-CRED-MACRO-3).
+// ---------------------------------------------------------------------------
+
+/// Type-erased "probe" used by the autoref-specialization trick to dispatch
+/// to either the macro-emitted inherent impl (populated marker slice) or the
+/// blanket [`CredentialsRegistry`] trait impl (empty fallback).
+///
+/// Consumers do not construct this directly; the `#[plexus::method]` codegen
+/// emits the call-site `(&CredentialsRegistryProbe::<ReturnType>::new()).marker_slice()`,
+/// and Rust's method-resolution rules pick the inherent impl over the trait
+/// impl when one exists. Types that derive `Credentials` have the inherent
+/// impl emitted by `plexus_macros`; types that do not derive `Credentials`
+/// fall back to the trait's empty-slice default.
+///
+/// # Why autoref-specialization?
+///
+/// The straightforward shape — a trait `CredentialsRegistry` with a default
+/// `marker_slice()` method — requires either (a) a blanket `impl<T>` (which
+/// then cannot be overridden by the derive without nightly specialization),
+/// or (b) every consumer type explicitly implementing the trait (which would
+/// be a breaking change for the entire workspace). The probe-with-autoref
+/// pattern preserves stable Rust, requires zero opt-in from non-deriving
+/// types, and lets the macro emit a normal inherent impl on the probe
+/// instance to override the fallback.
+///
+/// See `plans/AUTHZ/AUTHZ-CRED-MACRO-3-RUN-NOTES.md` for the design rationale
+/// and alternatives considered.
+#[doc(hidden)]
+pub struct CredentialsRegistryProbe<T: ?Sized>(::core::marker::PhantomData<fn() -> T>);
+
+impl<T: ?Sized> CredentialsRegistryProbe<T> {
+    /// Construct a fresh probe value. Free of runtime cost — the inner
+    /// `PhantomData` carries no data, only the type parameter.
+    #[doc(hidden)]
+    pub const fn new() -> Self {
+        Self(::core::marker::PhantomData)
+    }
+}
+
+impl<T: ?Sized> Default for CredentialsRegistryProbe<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Blanket-default trait that supplies an empty credential-marker slice for
+/// any type that does NOT derive `Credentials`.
+///
+/// The `#[derive(plexus_macros::Credentials)]` macro emits an **inherent**
+/// `impl CredentialsRegistryProbe<UserType> { pub fn marker_slice(...) ... }`
+/// that returns the populated slice; autoref method resolution prefers the
+/// inherent impl over this trait impl. See [`CredentialsRegistryProbe`] for
+/// the design rationale.
+///
+/// # Call site
+///
+/// `#[plexus::method]` codegen emits roughly:
+///
+/// ```ignore
+/// let markers: &'static [CredentialFieldMarker] =
+///     (&CredentialsRegistryProbe::<ReturnType>::new()).marker_slice();
+/// ```
+///
+/// The leading `&` triggers autoref; the inherent method on the probe wins
+/// when present, otherwise the trait's default body runs.
+pub trait CredentialsRegistry {
+    /// Return the slice of credential-field markers for the probed type. The
+    /// default body returns `&[]`; the `#[derive(Credentials)]` macro emits
+    /// an inherent override on `CredentialsRegistryProbe<T>` that returns
+    /// the populated slice.
+    fn marker_slice(&self) -> &'static [CredentialFieldMarker] {
+        &[]
+    }
+}
+
+// Blanket impl — every reference-to-probe gains the fallback `marker_slice`.
+// The leading `&` at the call site makes this the dispatch target unless an
+// inherent method with the same name exists on `CredentialsRegistryProbe<T>`,
+// in which case autoref/inherent-first resolution picks that instead.
+impl<T: ?Sized> CredentialsRegistry for &CredentialsRegistryProbe<T> {}
+
+// ---------------------------------------------------------------------------
 // Unit tests.
 // ---------------------------------------------------------------------------
 
@@ -1596,5 +1679,85 @@ mod tests {
         assert_eq!(metadata.kind, CredentialKind::Bearer);
         assert_eq!(metadata.issuer, issuer);
         assert!(metadata.sensitive, "always true per CredentialMetadata::new");
+    }
+
+    // -----------------------------------------------------------------------
+    // CredentialsRegistry — autoref-specialized fallback tests
+    // (AUTHZ-CRED-MACRO-3).
+    // -----------------------------------------------------------------------
+
+    /// The blanket trait impl on `&CredentialsRegistryProbe<T>` returns an
+    /// empty slice for any type that does not have an inherent override.
+    #[test]
+    fn credentials_registry_default_returns_empty_slice() {
+        struct PlainType;
+        let probe = CredentialsRegistryProbe::<PlainType>::new();
+        let markers: &'static [CredentialFieldMarker] = (&probe).marker_slice();
+        assert!(markers.is_empty(), "plain type yields empty marker slice");
+    }
+
+    /// The probe is constructible for arbitrary types, including types that
+    /// are not `Sized` and types that come from other crates. Smoke-checks
+    /// `CredentialsRegistryProbe::new()` is `const`.
+    #[test]
+    fn credentials_registry_probe_constructible_for_arbitrary_types() {
+        let _: CredentialsRegistryProbe<String> = CredentialsRegistryProbe::new();
+        let _: CredentialsRegistryProbe<Vec<u8>> = CredentialsRegistryProbe::new();
+        // `const` smoke-check.
+        const _: CredentialsRegistryProbe<()> = CredentialsRegistryProbe::new();
+    }
+
+    /// When an inherent `marker_slice` exists on the probe instantiation,
+    /// autoref method resolution picks the inherent over the trait default.
+    /// This simulates what `#[derive(Credentials)]` emits.
+    #[test]
+    fn credentials_registry_inherent_override_wins_over_blanket() {
+        struct OverridingType;
+
+        // Static marker slice that mirrors what the derive macro would emit.
+        // We use lazy-init via OnceLock to avoid const-init complications with
+        // `CredentialFieldMarker::new` (which holds owned `Vec<Scope>`).
+        fn markers() -> &'static [CredentialFieldMarker] {
+            use std::sync::OnceLock;
+            static M: OnceLock<Vec<CredentialFieldMarker>> = OnceLock::new();
+            M.get_or_init(|| {
+                vec![CredentialFieldMarker::new(
+                    None,
+                    "session",
+                    CredentialKind::Bearer,
+                    AttachmentSite::Header {
+                        name: HeaderName::try_new("authorization").unwrap(),
+                    },
+                    Some(CredentialScheme::new("Bearer ")),
+                    vec![],
+                    None,
+                    None,
+                )]
+            })
+            .as_slice()
+        }
+
+        // The shape of what `#[derive(Credentials)]` will emit: an inherent
+        // method on `CredentialsRegistryProbe<UserType>`.
+        impl CredentialsRegistryProbe<OverridingType> {
+            #[allow(dead_code)]
+            fn marker_slice(&self) -> &'static [CredentialFieldMarker] {
+                markers()
+            }
+        }
+
+        let probe = CredentialsRegistryProbe::<OverridingType>::new();
+        // No leading `&` → inherent method on the probe (by-ref self).
+        let m = probe.marker_slice();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].field, "session");
+        assert!(matches!(m[0].kind, CredentialKind::Bearer));
+
+        // With the leading `&` → autoref resolution should still prefer the
+        // inherent method (which takes `&self`) over the trait impl on
+        // `&CredentialsRegistryProbe<T>`.
+        let m2 = (&probe).marker_slice();
+        assert_eq!(m2.len(), 1, "inherent wins over blanket via autoref");
+        assert_eq!(m2[0].field, "session");
     }
 }
