@@ -22,6 +22,16 @@
 //! - [`SessionValidator`] — the trait perimeter validators implement.
 //! - [`VerifiedUser`] — sealed proof that an IdP-signed token was verified.
 //! - [`Principal`] — sealed authenticated-actor identity (user, service, anon).
+//! - [`Credential`] — sealed framework-level credential primitive. The only
+//!   path to a `Credential<T>` value is through [`CredentialMinter::mint`],
+//!   itself reachable only by accepting a framework-injected reference. The
+//!   custom `Serialize` impl emits a sentinel `{"$credential": "<id>"}` by
+//!   default; the dispatch layer routes the inner value to a sidecar via an
+//!   RAII guard while it builds the wire envelope (Tier B Q-WIRE-3).
+//! - [`CredentialMinter`] — the injected service that mints credentials.
+//! - [`CredentialMetadata`] — typed contract describing what the credential
+//!   is and how to attach it on subsequent calls (kind, attach site, scheme,
+//!   scopes, expiry, refresh/revoke hints, issuer, sensitivity).
 //!
 //! # Sealing protections (per AUTHZ-0)
 //!
@@ -49,9 +59,15 @@
 //! in the auth track and lands as a follow-up ticket.
 
 pub mod auth;
+pub mod credential;
 pub mod principal;
 pub mod verified_user;
 
 pub use auth::{AuthContext, SessionValidator};
+pub use credential::{
+    AttachmentSite, CapturedCredential, CookieName, Credential, CredentialId, CredentialIssuer,
+    CredentialKind, CredentialKindName, CredentialMetadata, CredentialMinter, CredentialScheme,
+    DispatchSidecar, HeaderName, MethodPath, Origin, ParamName, Scope,
+};
 pub use principal::{Principal, ServiceIdentity};
 pub use verified_user::VerifiedUser;
