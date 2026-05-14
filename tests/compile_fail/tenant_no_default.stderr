@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `Tenant: Default` is not satisfied
+  --> tests/compile_fail/tenant_no_default.rs:12:24
+   |
+12 |     requires_default::<Tenant>();
+   |                        ^^^^^^ the trait `Default` is not implemented for `Tenant`
+   |
+note: required by a bound in `requires_default`
+  --> tests/compile_fail/tenant_no_default.rs:9:24
+   |
+ 9 | fn requires_default<T: Default>() {}
+   |                        ^^^^^^^ required by this bound in `requires_default`

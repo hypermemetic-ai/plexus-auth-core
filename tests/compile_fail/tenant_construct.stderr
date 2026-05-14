@@ -1,0 +1,10 @@
+error[E0624]: associated function `try_new` is private
+  --> tests/compile_fail/tenant_construct.rs:13:21
+   |
+13 |     let _ = Tenant::try_new("victim-tenant");
+   |                     ^^^^^^^ private associated function
+   |
+  ::: src/tenant/types.rs
+   |
+   |     pub(crate) fn try_new(s: impl Into<String>) -> Result<Self, TenantError> {
+   |     ------------------------------------------------------------------------ private associated function defined here

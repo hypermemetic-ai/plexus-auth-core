@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/tenant_field_access.rs:11:13
+   |
+11 |     let _ = Tenant("victim-tenant".to_string());
+   |             ^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/tenant/types.rs
+   |
+   | pub struct Tenant(String);
+   |                   ^^^^^^ private field

@@ -21,6 +21,9 @@
 //!   - ServiceIdentity cannot be constructed externally
 //!   - VerifiedUser does not implement Default
 //!   - Principal does not implement Default
+//!   - Tenant cannot be constructed externally (AUTHZ-DATA-1-TYPES §5)
+//!   - Tenant has no public field (struct-literal fabrication rejected)
+//!   - Tenant does not implement Default (no silent isolation widening)
 //!
 //! AuthContext currently retains its `pub` constructor and `pub` fields
 //! (see RUN-NOTES). The full external-construction lockdown for
@@ -41,4 +44,7 @@ fn sealing_compile_fails() {
     t.compile_fail("tests/compile_fail/verified_user_no_default.rs");
     t.compile_fail("tests/compile_fail/principal_no_default.rs");
     t.compile_fail("tests/compile_fail/auth_context_no_default.rs");
+    t.compile_fail("tests/compile_fail/tenant_construct.rs");
+    t.compile_fail("tests/compile_fail/tenant_field_access.rs");
+    t.compile_fail("tests/compile_fail/tenant_no_default.rs");
 }
