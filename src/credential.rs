@@ -851,6 +851,157 @@ impl CredentialMinter {
 }
 
 // ---------------------------------------------------------------------------
+// CredentialFieldMarker — registry entry emitted by `#[derive(Credentials)]`.
+// ---------------------------------------------------------------------------
+
+/// A single registry entry describing one `#[credential(...)]`-annotated
+/// field on a credential-bearing type. The
+/// `#[derive(plexus_macros::Credentials)]` macro emits a per-type free
+/// function `__plexus_credential_marker_for_<TypeIdent>() ->
+/// Vec<CredentialFieldMarker>` returning these entries in stable
+/// declaration order.
+///
+/// # Shape
+///
+/// The fields below mirror the macro's emission contract (see
+/// `plexus-macros/src/credential.rs::emit_field_marker_initializer`):
+///
+/// - [`Self::variant`] — `Some(variant_name)` for enums, `None` for structs.
+/// - [`Self::field`] — the field's identifier, e.g. `"session"`. For tuple
+///   fields, the zero-based index as a string ("0", "1", ...).
+/// - [`Self::kind`] — credential kind (`Bearer`, `Cookie`, `OauthAccess`, ...).
+/// - [`Self::attach_as`] — where the credential is attached on the wire.
+/// - [`Self::scheme`] — optional attach-time prefix (e.g. `"Bearer "`).
+/// - [`Self::scopes`] — declared scopes for the credential.
+/// - [`Self::refresh_via`] — optional method to refresh an expired credential.
+/// - [`Self::revoke_via`] — optional method to revoke the credential.
+///
+/// # Aggregating into `CredentialMetadata`
+///
+/// The marker carries the credential's *static* metadata as declared at the
+/// field. The full [`CredentialMetadata`] form additionally requires
+/// `expires_at` (known only at mint time) and `issuer` (known only at runtime
+/// from the originating method). [`Self::to_metadata`] composes a partial
+/// `CredentialMetadata` value, leaving `expires_at` and `issuer` to be
+/// supplied by the dispatch layer.
+///
+/// # Consumers
+///
+/// - `AUTHZ-CRED-CORE-3` (schema-build credential reflection): reads markers
+///   to project credential metadata into the IR / `MethodSchema`.
+/// - Backends instrumenting the registry for diagnostic purposes.
+///
+/// # `parent_type_id` (deferred)
+///
+/// The ticket described a `parent_type_id: std::any::TypeId` field for
+/// `TypeId`-keyed registry lookup. The macro's v1 emission keys the registry
+/// by *function name* (`__plexus_credential_marker_for_<TypeIdent>`), not by
+/// `TypeId`; adding `parent_type_id` to this struct would require either
+/// (a) a `T: 'static` bound at the derive site, threading it through the
+/// macro, or (b) materializing the `TypeId` in the emitted function and
+/// stamping it onto every entry. Both are additive; neither is needed by the
+/// current consumer set (`AUTHZ-CRED-CORE-3`'s schema projection works from
+/// the function-name surface). Tracked as the follow-up note in
+/// `AUTHZ-CRED-MACRO-1-RUN-NOTES.md`.
+///
+/// Similarly, a `field_index: u16` is implicit in the slice index returned
+/// from the registry function; callers needing index can `.iter().enumerate()`.
+///
+/// # `TypeId` cross-compilation-unit caveat
+///
+/// When `parent_type_id` lands in a follow-up: `std::any::TypeId` is
+/// documented as stable *within a single compiled binary*, not across
+/// independently compiled libraries or Rust versions. The v1 use case
+/// (one binary registering markers and reading them in the same binary) is
+/// fine; cross-binary registry sharing would require a hashed name or a
+/// stable type-id scheme.
+#[derive(Debug, Clone)]
+pub struct CredentialFieldMarker {
+    /// For enums: the variant name where the field lives. For structs:
+    /// `None`.
+    pub variant: Option<&'static str>,
+
+    /// The field's identifier (e.g. `"session"`). For tuple fields, the
+    /// zero-based index rendered as a string.
+    pub field: &'static str,
+
+    /// Credential kind (Bearer, Cookie, OauthAccess, ...).
+    pub kind: CredentialKind,
+
+    /// Where on the wire the credential is attached when sent on subsequent
+    /// calls.
+    pub attach_as: AttachmentSite,
+
+    /// Optional attach-time prefix (e.g. `"Bearer "` for
+    /// `Authorization: Bearer <token>`).
+    pub scheme: Option<CredentialScheme>,
+
+    /// Declared scopes for the credential. Empty if not specified.
+    pub scopes: Vec<Scope>,
+
+    /// Optional method-path the framework calls to refresh this credential
+    /// when it expires.
+    pub refresh_via: Option<MethodPath>,
+
+    /// Optional method-path the framework calls to revoke this credential
+    /// server-side.
+    pub revoke_via: Option<MethodPath>,
+}
+
+impl CredentialFieldMarker {
+    /// Construct a marker. Public — registry entries are user-facing
+    /// metadata, not a sealed primitive. The macro emits struct-literal
+    /// initializers; this constructor exists for backend code that builds
+    /// markers programmatically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        variant: Option<&'static str>,
+        field: &'static str,
+        kind: CredentialKind,
+        attach_as: AttachmentSite,
+        scheme: Option<CredentialScheme>,
+        scopes: Vec<Scope>,
+        refresh_via: Option<MethodPath>,
+        revoke_via: Option<MethodPath>,
+    ) -> Self {
+        Self {
+            variant,
+            field,
+            kind,
+            attach_as,
+            scheme,
+            scopes,
+            refresh_via,
+            revoke_via,
+        }
+    }
+
+    /// Compose a [`CredentialMetadata`] from this marker plus the runtime-
+    /// supplied pieces (`expires_at` from mint time, `issuer` from the
+    /// invoking method's context).
+    ///
+    /// The marker carries the *static* metadata declared at the field; the
+    /// dispatch layer supplies the dynamic pieces. Together they fully
+    /// reconstruct the metadata that [`CredentialMinter::mint`] would mint.
+    pub fn to_metadata(
+        &self,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        issuer: CredentialIssuer,
+    ) -> CredentialMetadata {
+        CredentialMetadata::new(
+            self.kind.clone(),
+            self.attach_as.clone(),
+            self.scheme.clone(),
+            self.scopes.clone(),
+            expires_at,
+            self.refresh_via.clone(),
+            self.revoke_via.clone(),
+            issuer,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests.
 // ---------------------------------------------------------------------------
 
@@ -1377,5 +1528,73 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert!(captured.contains_key(event.access.id()));
         assert!(captured.contains_key(event.refresh.id()));
+    }
+
+    #[test]
+    fn credential_field_marker_constructs_via_new_and_struct_literal() {
+        // Acceptance criteria 2 + 3 (this ticket): the canonical
+        // `CredentialFieldMarker` is constructible from outside crate code
+        // via both struct-literal (because fields are `pub`) and `new`.
+        let m1 = CredentialFieldMarker::new(
+            None,
+            "session",
+            CredentialKind::Bearer,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            Some(CredentialScheme::new("Bearer ")),
+            vec![Scope::new("cone.send_message")],
+            Some(MethodPath::try_new("auth.refresh").unwrap()),
+            Some(MethodPath::try_new("auth.logout").unwrap()),
+        );
+        assert_eq!(m1.field, "session");
+        assert!(m1.variant.is_none());
+        assert!(matches!(m1.kind, CredentialKind::Bearer));
+        assert!(matches!(m1.attach_as, AttachmentSite::Header { .. }));
+        assert_eq!(m1.scheme.as_ref().map(|s| s.as_str()), Some("Bearer "));
+        assert_eq!(m1.scopes.len(), 1);
+
+        // Struct-literal construction also works (this is the form the
+        // macro emits).
+        let m2 = CredentialFieldMarker {
+            variant: Some("Issued"),
+            field: "session",
+            kind: CredentialKind::Bearer,
+            attach_as: AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            scheme: None,
+            scopes: vec![],
+            refresh_via: None,
+            revoke_via: None,
+        };
+        assert_eq!(m2.variant, Some("Issued"));
+        assert_eq!(m2.field, "session");
+    }
+
+    #[test]
+    fn credential_field_marker_composes_metadata() {
+        // The marker carries the static metadata; `to_metadata` composes
+        // a full `CredentialMetadata` with the runtime-supplied pieces.
+        let marker = CredentialFieldMarker::new(
+            None,
+            "session",
+            CredentialKind::Bearer,
+            AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap(),
+            },
+            Some(CredentialScheme::new("Bearer ")),
+            vec![Scope::new("cone.send_message")],
+            None,
+            None,
+        );
+        let issuer = CredentialIssuer::new(
+            Origin::new("ws://localhost:4444"),
+            MethodPath::try_new("auth.login").unwrap(),
+        );
+        let metadata = marker.to_metadata(None, issuer.clone());
+        assert_eq!(metadata.kind, CredentialKind::Bearer);
+        assert_eq!(metadata.issuer, issuer);
+        assert!(metadata.sensitive, "always true per CredentialMetadata::new");
     }
 }
