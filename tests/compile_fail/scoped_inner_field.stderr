@@ -1,0 +1,5 @@
+error[E0616]: field `inner` of struct `Scoped` is private
+  --> tests/compile_fail/scoped_inner_field.rs:10:20
+   |
+10 |     let _inner = s.inner;
+   |                    ^^^^^ private field

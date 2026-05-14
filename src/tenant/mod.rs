@@ -23,7 +23,9 @@
 //! `plans/AUTHZ/AUTHZ-DATA-S01-output.md` §§1-2 for the design.
 
 pub mod resolver;
+pub mod storage;
 pub mod types;
 
 pub use resolver::{ClaimTenantResolver, SingleTenantResolver, TenantResolver};
+pub use storage::{Scoped, TenantBoundary, TenantScopedStore, Tenanted};
 pub use types::{Tenant, TenantError};

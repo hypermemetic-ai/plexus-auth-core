@@ -78,4 +78,16 @@ fn sealing_compile_fails() {
     // cannot reach it; only the framework's dispatch path (AUTHLANG-3)
     // can construct a callee context from a caller's.
     t.compile_fail("tests/compile_fail/derive_callee_context_unreachable.rs");
+
+    // AUTHZ-DATA-1-WRAPPER acceptance criteria 2, 3, 4 plus the explicit
+    // "failing examples" called out in the ticket. Each compile-fail
+    // file documents the diagnostic it asserts (E0624 for private
+    // constructors, E0616 for private fields, E0277 for the unsatisfied
+    // `SealedStore` super-trait bound).
+    t.compile_fail("tests/compile_fail/tenant_scoped_store_seal.rs");
+    t.compile_fail("tests/compile_fail/tenanted_construct.rs");
+    t.compile_fail("tests/compile_fail/tenanted_inner_field.rs");
+    t.compile_fail("tests/compile_fail/scoped_inner_field.rs");
+    t.compile_fail("tests/compile_fail/tenant_boundary_construct.rs");
+    t.compile_fail("tests/compile_fail/tenant_boundary_struct_literal.rs");
 }
