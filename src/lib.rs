@@ -22,6 +22,12 @@
 //! - [`SessionValidator`] — the trait perimeter validators implement.
 //! - [`VerifiedUser`] — sealed proof that an IdP-signed token was verified.
 //! - [`Principal`] — sealed authenticated-actor identity (user, service, anon).
+//! - [`BackendAuthCapabilities`] — capability-advertisement payload served
+//!   at `_info` so generic clients can discover supported auth mechanisms
+//!   (AUTHZ-CORE-3). Composed of [`AuthMechanism`] variants
+//!   (`Bearer`, `Cookie`, `Oidc`, `Anonymous`) and the strong-typed
+//!   primitives [`MethodPath`], [`IssuerUrl`], [`ClientId`],
+//!   [`CookieName`], [`HeaderName`].
 //!
 //! # Sealing protections (per AUTHZ-0)
 //!
@@ -49,9 +55,15 @@
 //! in the auth track and lands as a follow-up ticket.
 
 pub mod auth;
+pub mod capabilities;
 pub mod principal;
 pub mod verified_user;
 
 pub use auth::{AuthContext, SessionValidator};
+pub use capabilities::{
+    AuthMechanism, BackendAuthCapabilities, BackendAuthCapabilitiesError, ClientId, ClientIdError,
+    CookieName, CookieNameError, HeaderName, HeaderNameError, IssuerUrl, IssuerUrlError,
+    MethodPath, MethodPathError,
+};
 pub use principal::{Principal, ServiceIdentity};
 pub use verified_user::VerifiedUser;

@@ -41,6 +41,11 @@ schemars = { version = "1.1", features = ["derive"] }
 # Async-trait so the SessionValidator-shaped traits can live here in the future.
 async-trait = "0.1"
 
+# Issuer URLs in OIDC AuthMechanism::Oidc. AUTHZ-S01-output §1 pins
+# `IssuerUrl(url::Url)` for the capability-advertisement type set landed in
+# AUTHZ-CORE-3.
+url = { version = "2", features = ["serde"] }
+
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
 # Principal cannot be constructed from outside this crate.
