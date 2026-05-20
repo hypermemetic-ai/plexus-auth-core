@@ -77,6 +77,12 @@
 //! `AuthContext` seal to match `VerifiedUser`/`Principal` is the next step
 //! in the auth track and lands as a follow-up ticket.
 
+/// Crate version, populated at compile time from `CARGO_PKG_VERSION`.
+///
+/// Exposed so the `plexus-rpc` umbrella can stamp it into the
+/// `Capabilities` manifest backends embed in `_info`. See UMB-2.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod audit;
 pub mod auth;
 pub mod capabilities;

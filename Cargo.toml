@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Sealed-type primitives for the Plexus auth framework: AuthContext, VerifiedUser, Principal."
 license = "AGPL-3.0-only"
+repository = "https://github.com/hypermemetic/plexus-auth-core"
 
 # Why this is its own crate:
 #
