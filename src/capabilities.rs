@@ -170,7 +170,7 @@ impl std::error::Error for BackendAuthCapabilitiesError {}
 /// Wildcards are NOT allowed — wildcards belong to `Scope` (AUTHZ-CORE-4).
 ///
 /// Per AUTHZ-S01-output §1.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct MethodPath(String);
 
@@ -232,7 +232,10 @@ fn is_valid_method_path(s: &str) -> bool {
     has_second_segment
 }
 
-fn is_valid_path_segment(seg: &str) -> bool {
+/// Shared segment grammar `[a-z][a-z0-9_]*` — used by `MethodPath` here and
+/// by the `Scope` / `RoleName` grammars in `crate::scope_registry`
+/// (AUTHZ-CORE-4).
+pub(crate) fn is_valid_path_segment(seg: &str) -> bool {
     let mut chars = seg.chars();
     let first = match chars.next() {
         Some(c) => c,

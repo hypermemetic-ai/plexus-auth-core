@@ -51,6 +51,13 @@
 //!   one scope check. [`AuditSink`] is the framework's persistence trait;
 //!   [`TracingAuditSink`] is the default impl emitting `tracing::info!`
 //!   events under `target = "plexus::audit"`.
+//! - [`ScopeRegistry`] — hub-level roles→scopes source of truth (R-0,
+//!   reviving AUTHZ-CORE-4 + CORE-6). [`Role`]s are named scope-sets with
+//!   transitive, build-time-cycle-rejected inheritance; [`Scope`] gains the
+//!   grammar-validated `try_new` and segment-bounded wildcard
+//!   [`Scope::matches`]; [`RoleName`] gains `try_new`. The dispatch gate
+//!   (R-5) computes `effective_scopes(AuthContext.roles)` and checks
+//!   `Scope::matches(required)`.
 //!
 //! # Sealing protections (per AUTHZ-0)
 //!
@@ -88,6 +95,7 @@ pub mod auth;
 pub mod capabilities;
 pub mod credential;
 pub mod principal;
+pub mod scope_registry;
 pub mod tenant;
 pub mod verified_user;
 
@@ -116,6 +124,9 @@ pub use forward::{
     PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
 };
 pub use principal::{Principal, ServiceIdentity};
+pub use scope_registry::{
+    Role, RoleNameError, ScopeError, ScopeRegistry, ScopeRegistryBuilder, ScopeRegistryError,
+};
 pub use tenant::{
     ClaimTenantResolver, Scoped, SingleTenantResolver, Tenant, TenantBoundary, TenantError,
     TenantResolver, TenantScopedStore, Tenanted,

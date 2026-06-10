@@ -125,8 +125,13 @@ macro_rules! string_newtype {
 pub use crate::capabilities::{CookieName, HeaderName, MethodPath};
 
 string_newtype! {
-    /// Atomic capability identifier, e.g. `cone.send_message`. Local stub
-    /// for the canonical `Scope` newtype pinned by AUTHZ-S01-output §1.
+    /// Atomic capability identifier, e.g. `cone.send_message`. Canonical
+    /// `Scope` newtype pinned by AUTHZ-S01-output §1. The grammar-validated
+    /// constructor (`Scope::try_new`), wildcard predicate (`is_wildcard`),
+    /// and segment-bounded matching (`Scope::matches`) live in
+    /// `crate::scope_registry` (AUTHZ-CORE-4). The macro-generated
+    /// `Scope::new` below stays unvalidated for wire-decoded values;
+    /// registry construction goes through `try_new`.
     Scope
 }
 

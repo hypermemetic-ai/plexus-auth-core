@@ -274,7 +274,7 @@ impl std::fmt::Display for SessionId {
 /// it here for the audit record's `roles: Vec<RoleName>` field. When the
 /// canonical type lands in `plexus-auth-core::capabilities`, this re-exports
 /// from there. The strong-typing discipline survives the move.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RoleName(String);
 
