@@ -43,6 +43,14 @@ path = "src/lib.rs"
 # `run_with_credential_capture` is publicly reachable.
 test-support = []
 
+# `oidc-reqwest` enables the batteries-included HTTP fetcher
+# (`oidc::ReqwestJwksFetcher`) behind the `oidc` module's `JwksFetcher`
+# trait. Off by default so the sealed-types crate stays lean for consumers
+# that don't run the validator (the trait itself is always compiled;
+# backends with their own HTTP stack inject a fetcher instead). Added by
+# UT-1 per UT-S01 D1.
+oidc-reqwest = ["dep:reqwest"]
+
 [dependencies]
 # Serialization. Note: Deserialize is intentionally implemented in a way that
 # documents the seal rather than offering a back-door. See module docs.
@@ -77,6 +85,19 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 # under `target = "plexus::audit"` so every backend gets observability for
 # free (AUTHZ-S01-output §8). Workspace pins `tracing = "0.1"`.
 tracing = "0.1"
+
+# UT-1 / UT-S01 D1: the OIDC validator (`src/oidc/`). `jsonwebtoken` is the
+# workspace's jose crate (plexus-trak already pins "9"); it covers RS256
+# signature validation, JWKS (RFC 7517) parsing via `jsonwebtoken::jwk`,
+# and `iss`/`aud`/`exp` claim checks. AUTH-2's spike contract names it as
+# the first-choice library.
+jsonwebtoken = "9"
+
+# Default discovery/JWKS HTTP fetcher, gated behind the `oidc-reqwest`
+# feature (see [features]). reqwest 0.12 is the workspace's usual HTTP
+# client (hyperforge, plexus-substrate, ...); rustls avoids a native TLS
+# linkage in this foundational crate.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /

@@ -102,9 +102,37 @@ impl AuthContext {
     }
 
     /// Get the tenant/realm from metadata (Keycloak multi-tenancy).
+    ///
+    /// Pre-UT-1 helper retained for compatibility. New code should prefer
+    /// [`AuthContext::tenant_id`], which returns the typed
+    /// [`TenantId`](crate::tenant::types::TenantId) and reads the
+    /// `org_id` claim first (UT-S01 D3).
     pub fn tenant(&self) -> Option<String> {
         self.get_metadata_string("tenant_id")
             .or_else(|| self.get_metadata_string("realm"))
+    }
+
+    /// The caller's tenant identity as a typed
+    /// [`TenantId`](crate::tenant::types::TenantId), if present.
+    ///
+    /// Reads `metadata["org_id"]` first (the tenancy claim pinned by
+    /// UT-S01 D3 — Auth0 Organizations convention), falling back to the
+    /// legacy `metadata["tenant_id"]` key for one deprecation window
+    /// (validators write the value under both keys during that window).
+    ///
+    /// Returns `None` when neither key is present **or** when the value
+    /// fails `TenantId` validation (empty / overlong / non-printable) —
+    /// a malformed tenant claim must not flow into comparisons as if it
+    /// named a real tenant.
+    ///
+    /// Note this is the *claim*, not authorization: tenancy enforcement
+    /// routes through the sealed [`Tenant`](crate::Tenant) minted by a
+    /// [`TenantResolver`](crate::TenantResolver), and the
+    /// [`TenantGate`](crate::TenantGate) predicates compare against that.
+    pub fn tenant_id(&self) -> Option<crate::tenant::types::TenantId> {
+        self.get_metadata_string("org_id")
+            .or_else(|| self.get_metadata_string("tenant_id"))
+            .and_then(|s| crate::tenant::types::TenantId::try_new(s).ok())
     }
 
     /// Framework-only constructor: derive a callee `AuthContext` from a
@@ -495,6 +523,56 @@ mod tests {
         assert!(callee.roles.is_empty());
         assert_eq!(callee.metadata, Value::Null);
         assert!(!callee.is_authenticated());
+    }
+
+    #[test]
+    fn tenant_id_prefers_org_id_claim() {
+        // UT-1 / UT-S01 D3: `org_id` is the tenancy claim; `tenant_id` is
+        // the one-release deprecation alias.
+        let ctx = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec![],
+            serde_json::json!({"org_id": "org_acme", "tenant_id": "legacy"}),
+        );
+        assert_eq!(
+            ctx.tenant_id().map(|t| t.as_str().to_string()),
+            Some("org_acme".to_string())
+        );
+    }
+
+    #[test]
+    fn tenant_id_falls_back_to_legacy_tenant_id_claim() {
+        let ctx = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec![],
+            serde_json::json!({"tenant_id": "acme"}),
+        );
+        assert_eq!(
+            ctx.tenant_id().map(|t| t.as_str().to_string()),
+            Some("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn tenant_id_is_none_when_absent_or_malformed() {
+        let absent = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec![],
+            serde_json::json!({"realm": "prod"}),
+        );
+        assert!(absent.tenant_id().is_none());
+
+        // Malformed (control byte) must not surface as a usable TenantId.
+        let malformed = AuthContext::new(
+            "alice".to_string(),
+            "sess-1".to_string(),
+            vec![],
+            serde_json::json!({"org_id": "evil\u{0000}org"}),
+        );
+        assert!(malformed.tenant_id().is_none());
     }
 
     #[test]

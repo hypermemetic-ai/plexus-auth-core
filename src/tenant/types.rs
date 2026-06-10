@@ -31,7 +31,115 @@
 //!   surface in practice.
 //! - **No mutation.** Inner field is private; no setters.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Shared validation predicate for tenant identifiers.
+///
+/// Used by both [`Tenant::try_new`] (the sealed, resolver-minted value) and
+/// [`TenantId::try_new`] (the public identifier newtype added by UT-1). The
+/// two types must accept exactly the same identifier shapes — a claim value
+/// that parses as a `TenantId` must be mintable as a `Tenant` by the
+/// resolver, and vice versa — so the rules live in one place.
+///
+/// Rules: non-empty, length ≤ 256 bytes, every byte in `0x20..=0x7e`
+/// (ASCII printable, excluding DEL). These keep tenant identifiers safe to
+/// use as filename components, SQL bind values, and audit log fields
+/// without further escaping.
+fn is_valid_tenant_identifier(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// A tenant *identifier* — the typed claim/tag value for tenant identity.
+///
+/// `TenantId` is the domain newtype UT-1 introduces so no framework API
+/// passes tenant identity as a bare `String`. It is the wire/storage shape
+/// of tenant identity:
+///
+/// - the `org_id` claim extracted from a validated OIDC token (UT-S01 D3),
+/// - the tenant tag a backend stores on a resource (e.g. trak's
+///   `meta.extra["tenant"]`),
+/// - the resource-side argument to the generalized
+///   [`TenantGate`](crate::tenant::gate::TenantGate) predicates.
+///
+/// # `TenantId` vs [`Tenant`]
+///
+/// `Tenant` is the **sealed proof** that the framework resolved the
+/// caller's tenant from a verified `AuthContext` — its constructor is
+/// crate-private and the only mint path is a [`TenantResolver`].
+/// `TenantId` is **typed data**, publicly constructible (with validation),
+/// because backends must be able to parse the tenant tag they stored on a
+/// resource in order to hand it to the gate. Possessing a `TenantId`
+/// grants nothing: every authorization decision compares a `TenantId`
+/// against the caller's resolver-minted `Tenant`, and only the framework
+/// can produce the latter.
+///
+/// [`TenantResolver`]: crate::tenant::resolver::TenantResolver
+///
+/// # Validation rules
+///
+/// Identical to [`Tenant`]: non-empty, ≤ 256 bytes, printable ASCII
+/// (no control bytes, no DEL). See `is_valid_tenant_identifier`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct TenantId(String);
+
+impl TenantId {
+    /// Parse a tenant identifier, validating its shape.
+    ///
+    /// Public — unlike [`Tenant::try_new`] — because `TenantId` is data,
+    /// not proof (see the type-level docs). Returns
+    /// [`TenantError::InvalidShape`] when the candidate is empty, longer
+    /// than 256 bytes, or contains non-printable bytes.
+    pub fn try_new(s: impl Into<String>) -> Result<Self, TenantError> {
+        let s = s.into();
+        if !is_valid_tenant_identifier(&s) {
+            return Err(TenantError::InvalidShape);
+        }
+        Ok(Self(s))
+    }
+
+    /// Borrow the inner identifier as `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TenantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A resolved [`Tenant`] names the same identifier space as [`TenantId`];
+/// downcasting proof → identifier is always safe (the reverse — identifier
+/// → proof — is only possible through a [`TenantResolver`]).
+///
+/// [`TenantResolver`]: crate::tenant::resolver::TenantResolver
+impl From<&Tenant> for TenantId {
+    fn from(t: &Tenant) -> Self {
+        // A `Tenant` was validated by the same predicate at mint time, so
+        // this cannot fail.
+        Self(t.as_str().to_string())
+    }
+}
+
+/// Identifier-vs-proof comparison: a caller's resolved `Tenant` matches a
+/// resource's stored `TenantId` iff the identifiers are bytewise equal.
+/// This is the comparison the [`TenantGate`](crate::tenant::gate::TenantGate)
+/// predicates perform.
+impl PartialEq<TenantId> for Tenant {
+    fn eq(&self, other: &TenantId) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+/// Symmetric counterpart of `Tenant == TenantId`.
+impl PartialEq<Tenant> for TenantId {
+    fn eq(&self, other: &Tenant) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
 
 /// A sealed unit of data isolation.
 ///
@@ -72,10 +180,7 @@ impl Tenant {
     /// `0x20..=0x7e` (ASCII printable, excluding DEL).
     pub(crate) fn try_new(s: impl Into<String>) -> Result<Self, TenantError> {
         let s = s.into();
-        if s.is_empty() || s.len() > 256 {
-            return Err(TenantError::InvalidShape);
-        }
-        if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        if !is_valid_tenant_identifier(&s) {
             return Err(TenantError::InvalidShape);
         }
         Ok(Self(s))
@@ -270,6 +375,67 @@ mod tests {
         // Inserting an equal value is a no-op.
         assert!(!set.insert(Tenant::try_new("acme").unwrap()));
         assert!(set.insert(Tenant::try_new("Acme").unwrap()));
+    }
+
+    // ── TenantId (UT-1) ────────────────────────────────────────────────
+
+    #[test]
+    fn tenant_id_accepts_same_shapes_as_tenant() {
+        TenantId::try_new("a1b2c3d4-e5f6-4789-9abc-def012345678").unwrap();
+        TenantId::try_new("auth0|507f1f77bcf86cd799439011").unwrap();
+        TenantId::try_new("org_hypermemetic").unwrap();
+        TenantId::try_new("acme-corp").unwrap();
+    }
+
+    #[test]
+    fn tenant_id_rejects_what_tenant_rejects() {
+        assert_eq!(TenantId::try_new(""), Err(TenantError::InvalidShape));
+        assert_eq!(
+            TenantId::try_new("a".repeat(257)),
+            Err(TenantError::InvalidShape)
+        );
+        assert_eq!(
+            TenantId::try_new("evil\0tenant"),
+            Err(TenantError::InvalidShape)
+        );
+        assert_eq!(
+            TenantId::try_new("alice\x7f"),
+            Err(TenantError::InvalidShape)
+        );
+    }
+
+    #[test]
+    fn tenant_id_as_str_and_display() {
+        let id = TenantId::try_new("org_hypermemetic").unwrap();
+        assert_eq!(id.as_str(), "org_hypermemetic");
+        assert_eq!(format!("{id}"), "org_hypermemetic");
+    }
+
+    #[test]
+    fn tenant_id_serde_round_trip_is_transparent() {
+        let id = TenantId::try_new("acme").unwrap();
+        let s = serde_json::to_string(&id).unwrap();
+        assert_eq!(s, r#""acme""#);
+        let back: TenantId = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn tenant_id_from_tenant_preserves_identifier() {
+        let t = Tenant::try_new("acme").unwrap();
+        let id = TenantId::from(&t);
+        assert_eq!(id.as_str(), "acme");
+    }
+
+    #[test]
+    fn tenant_and_tenant_id_compare_bytewise_across_types() {
+        let t = Tenant::try_new("acme").unwrap();
+        let same = TenantId::try_new("acme").unwrap();
+        let other = TenantId::try_new("neon").unwrap();
+        assert!(t == same);
+        assert!(same == t);
+        assert!(t != other);
+        assert!(other != t);
     }
 
     #[test]

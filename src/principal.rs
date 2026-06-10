@@ -127,6 +127,7 @@ mod tests {
             "https://idp.example.com".to_string(),
             1_700_000_000,
             1_700_003_600,
+            None,
         );
         let p = Principal::user_sealed(v);
         assert!(p.is_user());

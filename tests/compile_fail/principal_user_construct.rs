@@ -7,6 +7,6 @@ use plexus_auth_core::{Principal, VerifiedUser};
 
 fn main() {
     // Cannot get a VerifiedUser, so cannot get a Principal::User.
-    let v = VerifiedUser::new_sealed("alice".into(), "i".into(), 0, 0);
+    let v = VerifiedUser::new_sealed("alice".into(), "i".into(), 0, 0, None);
     let _ = Principal::User(v);
 }
