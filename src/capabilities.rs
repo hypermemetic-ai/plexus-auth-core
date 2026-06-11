@@ -500,6 +500,43 @@ pub enum AuthMechanism {
     Anonymous,
 }
 
+impl AuthMechanism {
+    /// The [`AttachmentSite`] this mechanism implies for credential
+    /// placement on subsequent calls — the CA-1 derivation rule (trak facet
+    /// `ccc924ad-0e78-4d4b-b71f-0018d249d0bf`).
+    ///
+    /// Mapping table:
+    ///
+    /// | Mechanism   | Implied site                            |
+    /// |-------------|-----------------------------------------|
+    /// | `Bearer`    | `Header { name: <advertised header> }`  |
+    /// | `Cookie`    | `Cookie { name: <advertised cookie> }`  |
+    /// | `Oidc`      | `Header { name: "authorization" }`      |
+    /// | `Anonymous` | `None` (nothing to attach)              |
+    ///
+    /// `Oidc` maps to the bearer convention (`Authorization: Bearer <jwt>`)
+    /// because the OIDC validator accepts the ID/access token there; an
+    /// OIDC backend whose exchanged session rides a cookie should advertise
+    /// a `Cookie` mechanism alongside (and mark it `default`) to steer the
+    /// derivation.
+    pub fn implied_attachment_site(&self) -> Option<crate::credential::AttachmentSite> {
+        use crate::credential::AttachmentSite;
+        match self {
+            AuthMechanism::Bearer { header } => Some(AttachmentSite::Header {
+                name: header.clone(),
+            }),
+            AuthMechanism::Cookie { cookie, .. } => Some(AttachmentSite::Cookie {
+                name: cookie.clone(),
+            }),
+            AuthMechanism::Oidc { .. } => Some(AttachmentSite::Header {
+                name: HeaderName::try_new("authorization")
+                    .expect("static header name is valid"),
+            }),
+            AuthMechanism::Anonymous => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BackendAuthCapabilities
 // ---------------------------------------------------------------------------
@@ -554,6 +591,33 @@ impl BackendAuthCapabilities {
             mechanisms: vec![AuthMechanism::Anonymous],
             default: None,
         }
+    }
+
+    /// The [`AttachmentSite`] this capability advertisement implies — used
+    /// by the framework to fill `RequiredCredential.site_hint` at
+    /// schema-assembly time (CA-1, trak facet
+    /// `ccc924ad-0e78-4d4b-b71f-0018d249d0bf`).
+    ///
+    /// Selection order:
+    ///
+    /// 1. The `default`-indexed mechanism, when set and it implies a site.
+    /// 2. Otherwise the first mechanism (advertisement order) that implies
+    ///    a site.
+    /// 3. Otherwise `None` (anonymous-only / empty advertisements imply no
+    ///    attach site — schemas stay byte-identical to pre-CA-1).
+    ///
+    /// [`AttachmentSite`]: crate::credential::AttachmentSite
+    pub fn implied_attachment_site(&self) -> Option<crate::credential::AttachmentSite> {
+        if let Some(site) = self
+            .default
+            .and_then(|idx| self.mechanisms.get(idx))
+            .and_then(AuthMechanism::implied_attachment_site)
+        {
+            return Some(site);
+        }
+        self.mechanisms
+            .iter()
+            .find_map(AuthMechanism::implied_attachment_site)
     }
 }
 
@@ -1013,5 +1077,104 @@ mod tests {
         // Round-trip back.
         let back: BackendAuthCapabilities = serde_json::from_value(v).unwrap();
         assert_eq!(back, caps);
+    }
+
+    // -- implied_attachment_site (CA-1) ---------------------------------------
+
+    use crate::credential::AttachmentSite;
+
+    fn bearer() -> AuthMechanism {
+        AuthMechanism::Bearer {
+            header: HeaderName::try_new("authorization").unwrap(),
+        }
+    }
+
+    fn cookie() -> AuthMechanism {
+        AuthMechanism::Cookie {
+            cookie: CookieName::try_new("plexus_session").unwrap(),
+            login: MethodPath::try_new("auth.login").unwrap(),
+            refresh: None,
+            logout: None,
+        }
+    }
+
+    fn oidc() -> AuthMechanism {
+        AuthMechanism::Oidc {
+            issuer: IssuerUrl::try_new("https://accounts.example.com/".parse().unwrap())
+                .unwrap(),
+            client_id: ClientId::try_new("plexus-substrate").unwrap(),
+            exchange: None,
+            request_scopes: vec!["openid".into()],
+        }
+    }
+
+    #[test]
+    fn mechanism_implied_site_mapping_table() {
+        assert_eq!(
+            bearer().implied_attachment_site(),
+            Some(AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap()
+            })
+        );
+        assert_eq!(
+            cookie().implied_attachment_site(),
+            Some(AttachmentSite::Cookie {
+                name: CookieName::try_new("plexus_session").unwrap()
+            })
+        );
+        // OIDC maps to the bearer convention.
+        assert_eq!(
+            oidc().implied_attachment_site(),
+            Some(AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap()
+            })
+        );
+        assert_eq!(AuthMechanism::Anonymous.implied_attachment_site(), None);
+    }
+
+    #[test]
+    fn capabilities_implied_site_prefers_default_index() {
+        // bearer first, cookie second, default = cookie → cookie wins.
+        let caps = BackendAuthCapabilities::new(vec![bearer(), cookie()], Some(1)).unwrap();
+        assert_eq!(
+            caps.implied_attachment_site(),
+            Some(AttachmentSite::Cookie {
+                name: CookieName::try_new("plexus_session").unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn capabilities_implied_site_falls_back_to_first_siteful_mechanism() {
+        // No default: first mechanism with a site wins (anonymous skipped).
+        let caps =
+            BackendAuthCapabilities::new(vec![AuthMechanism::Anonymous, cookie(), bearer()], None)
+                .unwrap();
+        assert_eq!(
+            caps.implied_attachment_site(),
+            Some(AttachmentSite::Cookie {
+                name: CookieName::try_new("plexus_session").unwrap()
+            })
+        );
+
+        // default points at Anonymous (no site) → fall back to first siteful.
+        let caps =
+            BackendAuthCapabilities::new(vec![AuthMechanism::Anonymous, bearer()], Some(0))
+                .unwrap();
+        assert_eq!(
+            caps.implied_attachment_site(),
+            Some(AttachmentSite::Header {
+                name: HeaderName::try_new("authorization").unwrap()
+            })
+        );
+    }
+
+    #[test]
+    fn capabilities_implied_site_none_for_anonymous_only_and_empty() {
+        let anon = BackendAuthCapabilities::anonymous_default();
+        assert_eq!(anon.implied_attachment_site(), None);
+
+        let empty = BackendAuthCapabilities::new(vec![], None).unwrap();
+        assert_eq!(empty.implied_attachment_site(), None);
     }
 }
