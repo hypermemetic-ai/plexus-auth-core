@@ -33,8 +33,21 @@
 //!   through the framework's [`TenantResolver`].
 //! - [`TenantResolver`] — derives a `Tenant` from a verified
 //!   `AuthContext`. Reference impls: [`ClaimTenantResolver`] (the 80%
-//!   case) and [`SingleTenantResolver`] (explicit single-tenant
-//!   opt-out).
+//!   case; default claim key `org_id` per UT-S01 D3) and
+//!   [`SingleTenantResolver`] (explicit single-tenant opt-out).
+//! - [`TenantId`] — the public, validated identifier newtype for tenant
+//!   identity (UT-1): claim values and stored resource tags. Data, not
+//!   proof — see its docs for the distinction from [`Tenant`].
+//! - [`TenantGate`] — the generalized tenant-isolation predicate layer
+//!   extracted from plexus-trak's reference gate (UT-1): reads scoped
+//!   not-found, writes forbidden, anonymous writes unauthenticated.
+//!   Backends tag resources via [`TenantTagged`] and convert
+//!   [`GateDenial`] into their wire errors.
+//! - [`oidc`] — the OIDC validator (UT-1, UT-S01 D1): discovery → JWKS
+//!   (cached per AUTH-8) → local RS256 validation of
+//!   `iss`/`aud`/`exp`/`iat` → mints the sealed [`VerifiedUser`] with the
+//!   `org_id` tenant. [`OidcSessionValidator`] adapts it to the
+//!   [`SessionValidator`] perimeter.
 //! - [`Credential`] — sealed framework-level credential primitive. The only
 //!   path to a `Credential<T>` value is through [`CredentialMinter::mint`],
 //!   itself reachable only by accepting a framework-injected reference. The
@@ -94,6 +107,7 @@ pub mod audit;
 pub mod auth;
 pub mod capabilities;
 pub mod credential;
+pub mod oidc;
 pub mod principal;
 pub mod scope_registry;
 pub mod tenant;
@@ -123,12 +137,16 @@ pub use forward::{
     Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,
     PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
 };
+pub use oidc::{
+    Audience, AudienceError, FetchError, FetchedDocument, JwksFetcher, OidcConfig, OidcError,
+    OidcSessionValidator, OidcValidator, VerifiedToken,
+};
 pub use principal::{Principal, ServiceIdentity};
 pub use scope_registry::{
     Role, RoleNameError, ScopeError, ScopeRegistry, ScopeRegistryBuilder, ScopeRegistryError,
 };
 pub use tenant::{
-    ClaimTenantResolver, Scoped, SingleTenantResolver, Tenant, TenantBoundary, TenantError,
-    TenantResolver, TenantScopedStore, Tenanted,
+    ClaimTenantResolver, GateDenial, Scoped, SingleTenantResolver, Tenant, TenantBoundary,
+    TenantError, TenantGate, TenantId, TenantResolver, TenantScopedStore, TenantTagged, Tenanted,
 };
 pub use verified_user::VerifiedUser;

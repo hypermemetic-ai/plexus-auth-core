@@ -5,11 +5,13 @@
 use plexus_auth_core::VerifiedUser;
 
 fn main() {
-    // Attempt 1: call the (sealed) constructor.
+    // Attempt 1: call the (sealed) constructor (5-arg shape since UT-1
+    // added the optional org_id tenant).
     let _ = VerifiedUser::new_sealed(
         "alice".to_string(),
         "https://idp.example.com".to_string(),
         0,
         0,
+        None,
     );
 }

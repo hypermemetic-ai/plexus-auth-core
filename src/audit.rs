@@ -102,6 +102,11 @@ struct VerifiedUserWire {
     issuer: String,
     issued_at: i64,
     expires_at: i64,
+    /// UT-1: the verified `org_id` tenant identity rides the wire mirror
+    /// so audit round-trips preserve it. `default` keeps pre-UT-1 audit
+    /// records (which lack the field) deserializable.
+    #[serde(default)]
+    tenant: Option<crate::tenant::types::TenantId>,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +130,7 @@ impl From<PrincipalWire> for Principal {
                 u.issuer,
                 u.issued_at,
                 u.expires_at,
+                u.tenant,
             )),
             PrincipalWire::Service(s) => {
                 Principal::service_sealed(ServiceIdentity::new_sealed(s.service_id))

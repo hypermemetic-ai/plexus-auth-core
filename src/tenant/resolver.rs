@@ -9,7 +9,8 @@
 //! Two reference implementations are provided:
 //!
 //! - [`ClaimTenantResolver`] — the 80% case: pull a configured claim out
-//!   of `AuthContext.metadata` (default key: `"tenant_id"`). When the
+//!   of `AuthContext.metadata` (default key: `"org_id"` per UT-S01 D3,
+//!   with a one-window `"tenant_id"` deprecation alias). When the
 //!   claim is absent and `single_user_fallback` is true, fall back to
 //!   the verified user id (single-user-deployment safe default).
 //!
@@ -84,10 +85,20 @@ pub(crate) fn mint_tenant_from_str(s: impl Into<String>) -> Result<Tenant, Tenan
 /// Reference impl: derive the tenant from an `AuthContext` claim.
 ///
 /// Reads a configured claim key from `AuthContext.metadata` (e.g.
-/// `"tenant_id"`, `"realm"`, `"org_id"`). When `single_user_fallback`
+/// `"org_id"`, `"tenant_id"`, `"realm"`). When `single_user_fallback`
 /// is true and the claim is absent, falls back to the caller's
 /// `user_id` so single-user deployments map each user 1:1 to their own
 /// tenant by default.
+///
+/// # Default claim key: `org_id` (UT-1, per UT-S01 D3)
+///
+/// The default claim key is **`org_id`** — the Auth0 Organizations
+/// convention pinned by the UT-S01 decision. For one deprecation window,
+/// a resolver configured with `claim_key == "org_id"` also consults the
+/// legacy `"tenant_id"` key when `org_id` is absent, so deployments whose
+/// validators still emit only `tenant_id` (e.g. pre-cutover trak) keep
+/// resolving. The alias is consulted *only* for the `org_id` default —
+/// a custom claim key is honored verbatim.
 ///
 /// # Why `single_user_fallback` defaults to `true`
 ///
@@ -99,21 +110,32 @@ pub(crate) fn mint_tenant_from_str(s: impl Into<String>) -> Result<Tenant, Tenan
 /// flip the bool to `false`.
 #[derive(Debug, Clone)]
 pub struct ClaimTenantResolver {
-    /// The metadata key to look up (e.g. `"tenant_id"`, `"realm"`,
-    /// `"org_id"`).
+    /// The metadata key to look up (e.g. `"org_id"`, `"tenant_id"`,
+    /// `"realm"`).
     pub claim_key: String,
     /// When the claim is absent, fall back to the caller's `user_id` as
     /// the tenant value. The single-user-deployment safe default.
     pub single_user_fallback: bool,
 }
 
+/// The default claim key (UT-S01 D3: Auth0 Organizations convention).
+const ORG_ID_CLAIM: &str = "org_id";
+
+/// Legacy claim key consulted as a deprecation alias when the resolver is
+/// configured with the [`ORG_ID_CLAIM`] default and `org_id` is absent.
+/// Removed after one release window (see UT-S01 D3).
+const LEGACY_TENANT_CLAIM: &str = "tenant_id";
+
 impl ClaimTenantResolver {
-    /// Construct with the default claim key `"tenant_id"` and
-    /// `single_user_fallback = true`. Matches the existing
-    /// `AuthContext::tenant()` helper's primary lookup key.
+    /// Construct with the default claim key `"org_id"` and
+    /// `single_user_fallback = true`.
+    ///
+    /// Until UT-1, the default key was `"tenant_id"`; UT-S01 D3 pins
+    /// `org_id` as the tenancy claim. The legacy key remains reachable
+    /// for one deprecation window via the alias documented on the type.
     pub fn new() -> Self {
         Self {
-            claim_key: "tenant_id".into(),
+            claim_key: ORG_ID_CLAIM.into(),
             single_user_fallback: true,
         }
     }
@@ -140,6 +162,15 @@ impl TenantResolver for ClaimTenantResolver {
     async fn resolve(&self, auth: &AuthContext) -> Result<Tenant, TenantError> {
         if let Some(claim) = auth.get_metadata_string(&self.claim_key) {
             return mint_tenant_from_str(claim);
+        }
+        // Deprecation alias (UT-S01 D3): the `org_id` default also reads
+        // the legacy `tenant_id` key for one release window, so pre-cutover
+        // validators that emit only `tenant_id` keep resolving. Custom
+        // claim keys are honored verbatim — no alias.
+        if self.claim_key == ORG_ID_CLAIM {
+            if let Some(claim) = auth.get_metadata_string(LEGACY_TENANT_CLAIM) {
+                return mint_tenant_from_str(claim);
+            }
         }
         if self.single_user_fallback && auth.is_authenticated() {
             return mint_tenant_from_str(auth.user_id.clone());
@@ -220,11 +251,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_resolver_pulls_tenant_id_by_default() {
+    async fn claim_resolver_pulls_org_id_by_default() {
+        // UT-1: the default claim key is `org_id` (UT-S01 D3).
+        let r = ClaimTenantResolver::new();
+        let auth = ctx_with_metadata("alice", json!({"org_id": "org_acme"}));
+        let t = r.resolve(&auth).await.unwrap();
+        assert_eq!(t.as_str(), "org_acme");
+    }
+
+    #[tokio::test]
+    async fn claim_resolver_default_prefers_org_id_over_legacy_alias() {
+        let r = ClaimTenantResolver::new();
+        let auth = ctx_with_metadata(
+            "alice",
+            json!({"org_id": "org_acme", "tenant_id": "legacy-acme"}),
+        );
+        let t = r.resolve(&auth).await.unwrap();
+        assert_eq!(t.as_str(), "org_acme");
+    }
+
+    #[tokio::test]
+    async fn claim_resolver_default_falls_back_to_legacy_tenant_id_alias() {
+        // Deprecation window (UT-S01 D3): tokens that still carry only
+        // `tenant_id` (e.g. pre-cutover trak) keep resolving.
         let r = ClaimTenantResolver::new();
         let auth = ctx_with_metadata("alice", json!({"tenant_id": "acme-corp"}));
         let t = r.resolve(&auth).await.unwrap();
         assert_eq!(t.as_str(), "acme-corp");
+    }
+
+    #[tokio::test]
+    async fn claim_resolver_custom_key_gets_no_legacy_alias() {
+        // The alias applies only to the `org_id` default; a deployment
+        // that configures `claim_key = "realm"` must not silently read
+        // `tenant_id`.
+        let r = ClaimTenantResolver {
+            claim_key: "realm".into(),
+            single_user_fallback: false,
+        };
+        let auth = ctx_with_metadata("alice", json!({"tenant_id": "acme"}));
+        let err = r.resolve(&auth).await.unwrap_err();
+        assert_eq!(err, TenantError::UnresolvedFromAuthContext);
     }
 
     #[tokio::test]
