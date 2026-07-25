@@ -15,6 +15,22 @@
 //!   between anonymous and verified-anonymous.
 //! - **No leaky `Deserialize`.** Not derived; raw JSON cannot fabricate one.
 //! - **No mutation.** Fields are private; only accessors expose data.
+//!
+//! # Not to be confused with [`crate::identity::Principal`]
+//!
+//! This crate has two types named `Principal`, and they answer different
+//! questions:
+//!
+//! - **this one** (`plexus_auth_core::Principal`) is the *caller-stamp*:
+//!   what **kind** of actor made this call — anonymous, a user, a service.
+//! - [`crate::identity::Principal`] is the *subject-name*: **which**
+//!   identity, and who vouches for it (`idp:<uuid>`, `nostr:<pubkey>`).
+//!
+//! They compose rather than compete — [`Principal::subject`] projects one
+//! into the other. The full resolution of the collision (including the third
+//! same-named type in `plexus-core`) is recorded in the
+//! [`crate::identity`] module docs, which is the single place to read about
+//! it.
 
 use crate::verified_user::VerifiedUser;
 use serde::Serialize;
@@ -106,6 +122,29 @@ impl Principal {
     /// Is this principal anonymous?
     pub fn is_anonymous(&self) -> bool {
         matches!(self, Self::Anonymous)
+    }
+
+    /// This caller-stamp's namespaced subject, when it names one.
+    ///
+    /// The bridge between the two `Principal`s in this crate — see the
+    /// [module docs](self) and [`crate::identity`]. The caller-stamp says
+    /// *what kind* of actor is calling; this projects that into *which*
+    /// identity, when the stamp carries enough to name one.
+    ///
+    /// - [`User`](Principal::User) — the verified user's id, interpreted as
+    ///   `idp:<uuid>`. `None` if that id is not a plexus-idp UUID (an
+    ///   externally-federated subject, say), because guessing a namespace
+    ///   for it would fabricate an identity.
+    /// - [`Service`](Principal::Service) — `None`. A service id is a
+    ///   workload name (a SPIFFE ID, say), not an issuer-namespaced subject;
+    ///   giving service identities a namespace is future work, not something
+    ///   to infer here.
+    /// - [`Anonymous`](Principal::Anonymous) — `None`, necessarily.
+    pub fn subject(&self) -> Option<crate::identity::Principal> {
+        match self {
+            Self::User(v) => crate::identity::Principal::from_legacy_user_id(v.user_id()),
+            Self::Service(_) | Self::Anonymous => None,
+        }
     }
 }
 

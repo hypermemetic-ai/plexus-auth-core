@@ -107,6 +107,12 @@ pub mod audit;
 pub mod auth;
 pub mod capabilities;
 pub mod credential;
+/// Namespaced identity and pluggable authentication (PLX-82).
+///
+/// Read [`identity`]'s module docs before using either `Principal`: this crate
+/// has two, they mean different things, and the module header is where that
+/// is written down.
+pub mod identity;
 pub mod oidc;
 pub mod principal;
 pub mod scope_registry;
@@ -119,7 +125,12 @@ pub use audit::{
     AuditDecision, AuditDenyReason, AuditRecord, AuditRecordKind, AuditSink, ForwardPolicyApplied,
     RoleName, ScopeCheck, SensitiveField, SessionId, TracingAuditSink, UserId,
 };
-pub use auth::{AuthContext, SessionValidator};
+pub use auth::{AuthContext, SessionValidator, PRINCIPAL_CLAIM};
+// NOTE: `identity::Principal` is deliberately NOT re-exported here. The crate
+// root's `Principal` is the sealed caller-stamp (`principal::Principal`), and
+// the subject-name type is reached only as `plexus_auth_core::identity::Principal`
+// — the same disambiguation-by-module-path that `plexus-core` uses. See the
+// `identity` module docs for the full resolution of the name collision.
 pub use capabilities::{
     AuthMechanism, BackendAuthCapabilities, BackendAuthCapabilitiesError, ClientId, ClientIdError,
     CookieName, CookieNameError, HeaderName, HeaderNameError, IssuerUrl, IssuerUrlError,

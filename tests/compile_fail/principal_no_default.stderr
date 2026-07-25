@@ -1,5 +1,5 @@
-error[E0277]: the trait bound `Principal: Default` is not satisfied
+error[E0277]: the trait bound `plexus_auth_core::Principal: Default` is not satisfied
  --> tests/compile_fail/principal_no_default.rs:8:24
   |
 8 |     let _: Principal = Default::default();
-  |                        ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Principal`
+  |                        ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `plexus_auth_core::Principal`
