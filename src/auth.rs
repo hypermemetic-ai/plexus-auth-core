@@ -19,6 +19,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The metadata key under which a verified
+/// [`Principal`](crate::identity::Principal) is stamped.
+///
+/// See [`AuthContext::principal`] for why the principal lives in `metadata`
+/// rather than in a field of its own.
+pub const PRINCIPAL_CLAIM: &str = "principal";
+
 /// Per-connection authentication context, populated during WS upgrade.
 ///
 /// This context is extracted from HTTP cookies (or other auth mechanisms) during
@@ -81,6 +88,96 @@ impl AuthContext {
             roles: vec![],
             metadata: Value::Null,
         }
+    }
+
+    /// Create a context for a verified [`Principal`](crate::identity::Principal).
+    ///
+    /// The namespaced constructor: `user_id` is derived from the principal
+    /// rather than supplied, so the two cannot be set to different things.
+    /// Prefer building this through
+    /// [`Authenticated::into_auth_context`](crate::identity::Authenticated::into_auth_context),
+    /// which additionally requires a proof that authentication happened.
+    pub fn for_principal(
+        principal: &crate::identity::Principal,
+        session_id: impl Into<String>,
+        roles: Vec<String>,
+        metadata: Value,
+    ) -> Self {
+        let mut map = match metadata {
+            Value::Object(m) => m,
+            Value::Null => serde_json::Map::new(),
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("claims".to_string(), other);
+                m
+            }
+        };
+        map.insert(
+            PRINCIPAL_CLAIM.to_string(),
+            Value::String(principal.to_string()),
+        );
+        Self {
+            user_id: principal.as_legacy_user_id(),
+            session_id: session_id.into(),
+            roles,
+            metadata: Value::Object(map),
+        }
+    }
+
+    /// The caller's namespaced [`Principal`](crate::identity::Principal).
+    ///
+    /// # Why this is a method and not a field
+    ///
+    /// PLX-82 requires this to be **additive**, and `AuthContext` has all-`pub`
+    /// fields that at least six sites across plexus-core, plexus-transport,
+    /// and plexus-macros construct with an exhaustive struct literal —
+    /// including `plexus_core::plexus::test_validator`, which is library code,
+    /// not a test. Adding a sixth field would fail to compile every one of
+    /// them, in crates this build is not permitted to modify. It would also
+    /// change the `Deserialize` and `JsonSchema` shape of a type that crosses
+    /// the wire.
+    ///
+    /// Deriving the principal instead costs nothing and buys something the
+    /// field could not: **`principal` and `user_id` cannot disagree, because
+    /// there is nowhere for them to disagree.** There is one storage location
+    /// for an idp identity, and both accessors read it.
+    ///
+    /// # Resolution order
+    ///
+    /// 1. `metadata["principal"]`, if present and parseable — this is what
+    ///    [`Authenticated::into_auth_context`] stamps, and it is the only
+    ///    route by which a non-idp principal (a `nostr:` pubkey, an
+    ///    `apikey:` id) can be carried.
+    /// 2. Otherwise `idp:<user_id>`, when `user_id` is a canonical UUID —
+    ///    the migration path for every context built before this build, and
+    ///    for any [`SessionValidator`] not yet ported to an
+    ///    [`Authenticator`](crate::identity::Authenticator).
+    ///
+    /// Returns `None` for anonymous contexts and for any `user_id` that is
+    /// not a plexus-idp UUID. `None` means "no principal can be named here",
+    /// never "authenticated as someone else".
+    ///
+    /// # This is a claim, not an authorization
+    ///
+    /// Same caveat as [`AuthContext::tenant_id`]: holding a `Principal` says
+    /// who the context names, not what it may do. The proof that
+    /// authentication occurred is
+    /// [`Authenticated`](crate::identity::Authenticated), which only an
+    /// `Authenticator` produces.
+    ///
+    /// [`Authenticated::into_auth_context`]: crate::identity::Authenticated::into_auth_context
+    pub fn principal(&self) -> Option<crate::identity::Principal> {
+        if let Some(raw) = self.get_metadata_string(PRINCIPAL_CLAIM) {
+            if let Ok(p) = raw.parse::<crate::identity::Principal>() {
+                return Some(p);
+            }
+            // A present-but-unparseable stamp is a corrupt claim. Falling
+            // through to the `user_id` derivation would answer a different
+            // question than the one the stamp was trying to answer, so this
+            // is a hard `None`.
+            return None;
+        }
+        crate::identity::Principal::from_legacy_user_id(&self.user_id)
     }
 
     /// Check if this context represents an authenticated user.
@@ -197,11 +294,22 @@ impl AuthContext {
         // `keep_capabilities` is a no-op today: the current AuthContext has no
         // capabilities field. The flag is preserved on `ForwardDerivation` for
         // forward compatibility with the AUTHZ-DATA / AUTHZ-CRED migration.
-        let metadata = if derivation.keep_metadata {
+        let mut metadata = if derivation.keep_metadata {
             caller_ctx.metadata.clone()
         } else {
             Value::Null
         };
+        // The principal stamp lives in `metadata` (see `AuthContext::principal`),
+        // so dropping the verified user has to drop the stamp too. Without
+        // this, `keep_verified_user: false` + `keep_metadata: true` would reset
+        // `user_id` to "anonymous" while `principal()` kept answering with the
+        // caller's identity — the derivation would leak exactly the thing it
+        // was asked to strip.
+        if !derivation.keep_verified_user {
+            if let Value::Object(ref mut map) = metadata {
+                map.remove(PRINCIPAL_CLAIM);
+            }
+        }
         AuthContext {
             user_id,
             session_id,
@@ -523,6 +631,72 @@ mod tests {
         assert!(callee.roles.is_empty());
         assert_eq!(callee.metadata, Value::Null);
         assert!(!callee.is_authenticated());
+    }
+
+    // PLX-82: the principal stamp lives in `metadata`, so a derivation that
+    // drops the verified user must drop the stamp with it. Without the
+    // removal in `derive_callee_context`, PASS_THROUGH-with-anonymous-identity
+    // would reset `user_id` to "anonymous" while `principal()` kept answering
+    // with the caller — leaking exactly what was asked to be stripped.
+    #[test]
+    fn dropping_the_verified_user_also_drops_the_principal_stamp() {
+        use crate::forward::ForwardDerivation;
+        use crate::identity::Principal as Subject;
+        use crate::principal::Principal;
+
+        let subject: Subject = "idp:6ba7b810-9dad-11d1-80b4-00c04fd430c8".parse().unwrap();
+        let caller = AuthContext::for_principal(
+            &subject,
+            "sess-1",
+            vec!["admin".to_string()],
+            serde_json::json!({"org_id": "acme"}),
+        );
+        assert_eq!(caller.principal(), Some(subject.clone()));
+
+        let stamp = Principal::anonymous_sealed();
+
+        // Kept: identity survives, and both views agree.
+        let kept =
+            AuthContext::derive_callee_context(&caller, &ForwardDerivation::PASS_THROUGH, &stamp);
+        assert_eq!(kept.principal(), Some(subject));
+        assert_eq!(kept.user_id, "6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+
+        // Dropped: `user_id` is anonymized AND the stamp is gone.
+        let dropped =
+            AuthContext::derive_callee_context(&caller, &ForwardDerivation::ANONYMOUS, &stamp);
+        assert_eq!(dropped.user_id, "anonymous");
+        assert_eq!(dropped.principal(), None);
+
+        // The dangerous combination specifically: metadata kept, identity not.
+        let mixed = ForwardDerivation {
+            keep_verified_user: false,
+            keep_roles: false,
+            keep_capabilities: false,
+            keep_metadata: true,
+        };
+        let mixed = AuthContext::derive_callee_context(&caller, &mixed, &stamp);
+        assert_eq!(mixed.user_id, "anonymous");
+        assert_eq!(
+            mixed.principal(),
+            None,
+            "keep_metadata must not smuggle the caller's principal through"
+        );
+        // Non-identity metadata is still retained.
+        assert_eq!(mixed.get_metadata_string("org_id").as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn for_principal_and_new_agree_on_an_idp_identity() {
+        use crate::identity::Principal as Subject;
+
+        let uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let subject: Subject = format!("idp:{uuid}").parse().unwrap();
+
+        let stamped = AuthContext::for_principal(&subject, "s", vec![], Value::Null);
+        let legacy = AuthContext::new(uuid.to_string(), "s".to_string(), vec![], Value::Null);
+
+        assert_eq!(stamped.user_id, legacy.user_id);
+        assert_eq!(stamped.principal(), legacy.principal());
     }
 
     #[test]
