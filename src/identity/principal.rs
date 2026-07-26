@@ -7,15 +7,17 @@
 //!
 //! # Relationship to `plexus_core::identity::Principal`
 //!
-//! PLX-75 landed a type of the same name, same string grammar, and same wire
-//! form in `plexus-core`. This one is a deliberate **mirror**, not a fork:
-//! `plexus-core` depends on `plexus-auth-core`, so the dependency arrow makes
-//! it impossible for `AuthContext` (which lives here) to name the plexus-core
-//! type. The grammar is pinned identical on purpose so that
-//! `plexus_core::identity::Principal` can be collapsed into a re-export of
-//! this type in a follow-up with no wire, no storage, and no API change.
-//! `plexus-idp/tests/principal_equivalence.rs` mechanically asserts the two
-//! agree on every accepted and rejected form.
+//! They are the **same type**. PLX-75 originally landed a type of the same
+//! name, grammar, and wire form in `plexus-core`; PLX-82 discovered that
+//! `plexus-core` depends on `plexus-auth-core` and never the reverse, so
+//! `AuthContext` (which lives here) could not name it, and wrote a mirror
+//! here kept in sync by an equivalence test. PLX-87 collapsed the two:
+//! **this is the one definition**, and `plexus_core::identity` is a
+//! `pub use` of this module's items, so `plexus_core::identity::Principal`
+//! keeps working for every consumer PLX-75 wrote for. There is nothing left
+//! to keep in sync, so the equivalence test
+//! (`plexus-idp/tests/principal_equivalence.rs`) was deleted with the
+//! duplication it guarded.
 
 use std::fmt;
 use std::str::FromStr;
@@ -137,11 +139,11 @@ impl fmt::Display for Issuer {
 
 /// Why a string is not a valid [`Principal`].
 ///
-/// Intentionally **not** `#[non_exhaustive]`, mirroring
-/// `plexus_core::identity::PrincipalParseError` exactly so that collapsing
-/// that type into a re-export of this one is a no-op for downstream `match`
-/// arms. The `Display` strings are pinned identical for the same reason and
-/// are asserted equal by `plexus-idp/tests/principal_equivalence.rs`.
+/// Intentionally **not** `#[non_exhaustive]`: `plexus_core::identity::`
+/// `PrincipalParseError` re-exports this type (PLX-87), and PLX-75's original
+/// was exhaustive, so downstream `match` arms written against the plexus-core
+/// path keep compiling. The `Display` strings are byte-identical to PLX-75's
+/// for the same reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrincipalParseError {
     /// No `:` separator at all.
@@ -433,5 +435,240 @@ mod tests {
     fn idp_helper_matches_manual_construction() {
         let u = uuid::Uuid::parse_str(UUID).unwrap();
         assert_eq!(Principal::idp(&u), Principal::new(Issuer::Idp, UUID).unwrap());
+        assert_eq!(Principal::idp(&u).to_string(), format!("idp:{UUID}"));
+    }
+
+    // ---------------------------------------------------------------------
+    // PLX-87: coverage folded in from the two things this type replaced —
+    // `plexus_core::identity::principal`'s unit tests (PLX-75), now deleted
+    // because plexus-core re-exports this module, and the accepted/rejected
+    // corpus from `plexus-idp/tests/principal_equivalence.rs` (PLX-82), also
+    // deleted because there is no longer a second implementation to equate.
+    // The assertions below are the *union* of what those two files asserted
+    // about this grammar; none of that coverage was dropped in the collapse.
+    // ---------------------------------------------------------------------
+
+    /// Every form both former implementations were required to accept.
+    const ACCEPTED: &[&str] = &[
+        "idp:6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "idp:00000000-0000-4000-8000-000000000001",
+        "nostr:3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
+        "nostr:0000000000000000000000000000000000000000000000000000000000000000",
+        "apikey:ak_live_01HQ8ZQK",
+        "apikey:a",
+        "apikey:!#$%&'()*+,-./",
+    ];
+
+    /// Every form both former implementations were required to reject.
+    const REJECTED: &[&str] = &[
+        // no separator
+        "idp",
+        "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "",
+        // unknown issuer
+        "ldap:someone",
+        "IDP:6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "Nostr:3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
+        ":x",
+        // empty subject
+        "idp:",
+        "nostr:",
+        "apikey:",
+        // second separator
+        "idp:6ba7b810-9dad-11d1-80b4-00c04fd430c8:extra",
+        "apikey:ak:live",
+        // non-canonical uuid
+        "idp:not-a-uuid",
+        "idp:6ba7b8109dad11d180b400c04fd430c8",
+        "idp:{6ba7b810-9dad-11d1-80b4-00c04fd430c8}",
+        "idp:6BA7B810-9DAD-11D1-80B4-00C04FD430C8",
+        // bad nostr pubkeys
+        "nostr:3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459",
+        "nostr:3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459da",
+        "nostr:3BF0C63FCB93463407AF97A5E5EE64FA883D107EF9E558472C4EB9AAAEFA459D",
+        "nostr:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        // bad api key ids
+        "apikey:ak live",
+        "apikey:ak\tlive",
+        "apikey:ak\"live",
+        "apikey:ak\\live",
+    ];
+
+    #[test]
+    fn accepts_the_whole_accepted_corpus_and_round_trips_it_exactly() {
+        for s in ACCEPTED {
+            let p: Principal = s
+                .parse()
+                .unwrap_or_else(|e| panic!("`{s}` should be accepted: {e}"));
+            assert_eq!(p.to_string(), *s, "must round-trip `{s}` exactly");
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{s}\""), "wire form must be a bare string");
+            assert_eq!(serde_json::from_str::<Principal>(&json).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn rejects_the_whole_rejected_corpus_at_both_entry_points() {
+        for s in REJECTED {
+            assert!(s.parse::<Principal>().is_err(), "`{s:?}` must be rejected");
+            // Deserialization must not be a back door around FromStr.
+            let doc = serde_json::to_string(s).unwrap();
+            assert!(
+                serde_json::from_str::<Principal>(&doc).is_err(),
+                "`{s:?}` must be rejected by Deserialize too"
+            );
+        }
+    }
+
+    #[test]
+    fn issuer_and_subject_are_split_correctly() {
+        let p: Principal = format!("idp:{UUID}").parse().unwrap();
+        assert_eq!(p.issuer(), Issuer::Idp);
+        assert_eq!(p.subject(), UUID);
+
+        let p: Principal = format!("nostr:{PUBKEY}").parse().unwrap();
+        assert_eq!(p.issuer(), Issuer::Nostr);
+        assert_eq!(p.subject(), PUBKEY);
+
+        let p: Principal = "apikey:ak_live_01HQ8ZQK".parse().unwrap();
+        assert_eq!(p.issuer(), Issuer::ApiKey);
+        assert_eq!(p.subject(), "ak_live_01HQ8ZQK");
+    }
+
+    #[test]
+    fn deserialization_error_text_names_the_rule_that_was_broken() {
+        let err = serde_json::from_str::<Principal>("\"ldap:someone\"").unwrap_err();
+        assert!(err.to_string().contains("unknown principal issuer"), "{err}");
+
+        let err = serde_json::from_str::<Principal>("\"nostr:NOTHEX\"").unwrap_err();
+        assert!(err.to_string().contains("nostr pubkey"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_issuer_including_wrong_case() {
+        assert!(matches!(
+            "ldap:someone".parse::<Principal>(),
+            Err(PrincipalParseError::UnknownIssuer(i)) if i == "ldap"
+        ));
+        // Capitalization of the issuer is not a known issuer either.
+        assert!(matches!(
+            "IDP:6ba7b810-9dad-11d1-80b4-00c04fd430c8".parse::<Principal>(),
+            Err(PrincipalParseError::UnknownIssuer(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_subject_for_every_issuer() {
+        for issuer in ["idp", "nostr", "apikey"] {
+            let s = format!("{issuer}:");
+            assert!(
+                matches!(
+                    s.parse::<Principal>(),
+                    Err(PrincipalParseError::EmptySubject(_))
+                ),
+                "{s} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_separator() {
+        assert!(matches!(
+            "idp".parse::<Principal>(),
+            Err(PrincipalParseError::MissingSeparator(_))
+        ));
+        assert!(matches!(
+            UUID.parse::<Principal>(),
+            Err(PrincipalParseError::MissingSeparator(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_nostr_pubkey_of_wrong_length() {
+        let short = &PUBKEY[..63];
+        let long = format!("{PUBKEY}a");
+        assert_eq!(short.len(), 63);
+        assert_eq!(long.len(), 65);
+
+        for bad in [short.to_string(), long] {
+            let s = format!("nostr:{bad}");
+            match s.parse::<Principal>() {
+                Err(PrincipalParseError::InvalidNostrPubkey { reason, .. }) => {
+                    assert_eq!(reason, "expected exactly 64 hex characters");
+                }
+                other => panic!("{s} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_uppercase_nostr_hex() {
+        let upper = PUBKEY.to_uppercase();
+        assert_eq!(upper.len(), 64);
+        let s = format!("nostr:{upper}");
+        match s.parse::<Principal>() {
+            Err(PrincipalParseError::InvalidNostrPubkey { reason, .. }) => {
+                assert_eq!(reason, "expected lowercase hex only");
+            }
+            other => panic!("uppercase hex should be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_embedded_second_colon() {
+        for s in [
+            format!("idp:{UUID}:extra"),
+            format!("nostr:{PUBKEY}:extra"),
+            "apikey:ak:live".to_string(),
+        ] {
+            assert!(
+                matches!(
+                    s.parse::<Principal>(),
+                    Err(PrincipalParseError::SubjectContainsSeparator(_))
+                ),
+                "{s} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_uuid() {
+        for bad in [
+            "not-a-uuid",
+            "6ba7b8109dad11d180b400c04fd430c8",       // simple form
+            "{6ba7b810-9dad-11d1-80b4-00c04fd430c8}", // braced form
+            "6BA7B810-9DAD-11D1-80B4-00C04FD430C8",   // uppercase
+        ] {
+            let s = format!("idp:{bad}");
+            assert!(
+                matches!(
+                    s.parse::<Principal>(),
+                    Err(PrincipalParseError::InvalidUuid(_))
+                ),
+                "{s} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unprintable_api_key_ids() {
+        for bad in ["ak live", "ak\tlive", "ak\"live", "ak\\live"] {
+            let s = format!("apikey:{bad}");
+            assert!(
+                matches!(
+                    s.parse::<Principal>(),
+                    Err(PrincipalParseError::InvalidApiKeyId(_))
+                ),
+                "{s:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn new_validates_like_from_str() {
+        assert!(Principal::new(Issuer::Idp, UUID).is_ok());
+        assert!(Principal::new(Issuer::Idp, "nope").is_err());
+        assert!(Principal::new(Issuer::Nostr, PUBKEY).is_ok());
+        assert!(Principal::new(Issuer::Nostr, "").is_err());
     }
 }

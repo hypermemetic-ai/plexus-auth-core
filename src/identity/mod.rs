@@ -36,11 +36,10 @@
 //! ambiguity was, and a module path removes it. There is no glob re-export
 //! anywhere that could make them shadow one another.
 //!
-//! ## The third one: `plexus_core::identity::Principal`
+//! ## There is no third one: `plexus_core::identity::Principal` IS this type
 //!
-//! PLX-75 landed a subject-name type in `plexus-core`. This module's
-//! [`Principal`] is a **deliberate mirror of it**, not a fork, and the
-//! reason is a hard dependency fact PLX-82's contract did not account for:
+//! PLX-75 originally landed a subject-name type in `plexus-core`, before the
+//! layering constraint was known:
 //!
 //! > `plexus-core` depends on `plexus-auth-core`. `plexus-auth-core` depends
 //! > on no plexus crate at all — that is the entire point of the crate (see
@@ -49,16 +48,16 @@
 //! > here. It therefore **cannot** name `plexus_core::identity::Principal`
 //! > without inverting the dependency arrow.
 //!
-//! So the type is defined here, at the bottom of the stack where
-//! `AuthContext` can reach it, with the grammar, `Display`/`FromStr`
-//! behavior, and wire form pinned byte-for-byte identical to PLX-75's. The
-//! follow-up is mechanical and non-breaking: `plexus_core::identity` becomes
-//! `pub use plexus_auth_core::identity::{Issuer, Principal, PrincipalParseError};`
-//! and the duplicate implementation is deleted. Until then,
-//! `plexus-idp/tests/principal_equivalence.rs` — which can see both crates —
-//! asserts mechanically that the two agree on every accepted form, every
-//! rejected form, and every serialization, so they cannot drift while the
-//! duplication lasts.
+//! PLX-82 worked around that with a byte-for-byte mirror here, kept in step
+//! by an equivalence test in plexus-idp. **PLX-87 removed the duplication
+//! rather than policing it**: this module is now the single definition, at
+//! the bottom of the stack where `AuthContext` can reach it, and
+//! `plexus_core::identity` is
+//! `pub use plexus_auth_core::identity::{Issuer, Principal, PrincipalParseError};`.
+//! The public path PLX-75 established keeps working and now names the same
+//! type, so drift is not merely detected — it is unrepresentable. The
+//! equivalence test was deleted along with the second definition it guarded;
+//! its accepted/rejected corpus lives on in `principal.rs`'s unit tests.
 
 mod authenticator;
 mod linking;
