@@ -158,6 +158,7 @@ pub use scope_registry::{
 };
 pub use tenant::{
     ClaimTenantResolver, GateDenial, Scoped, SingleTenantResolver, Tenant, TenantBoundary,
-    TenantError, TenantGate, TenantId, TenantResolver, TenantScopedStore, TenantTagged, Tenanted,
+    TenantError, TenantGate, TenantId, TenantResolver, TenantRole, TenantScopedStore, TenantTagged,
+    Tenanted, UnknownRole,
 };
 pub use verified_user::VerifiedUser;

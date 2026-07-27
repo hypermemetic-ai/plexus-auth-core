@@ -25,6 +25,16 @@
 //!   for tenant identity (claim values, stored tags). Data, not proof —
 //!   see its docs for the `TenantId` vs `Tenant` distinction.
 //!
+//! PLX-126 (M4·B) adds one more:
+//!
+//! - `TenantRole` (in [`role`]) — the enumerated vocabulary of what a
+//!   principal may be *within* a tenant. The membership records
+//!   themselves live in plexus-idp (which owns the identity database);
+//!   the vocabulary lives here because the crates that make decisions
+//!   about members — plexus-core, plexus-substrate, the M4·C mount gate —
+//!   depend on plexus-auth-core and can never depend on plexus-idp. See
+//!   that module's docs.
+//!
 //! - `TenantGate` (in [`gate`]) — the generalized tenant-isolation
 //!   predicate layer extracted from plexus-trak's reference gate: reads
 //!   scoped not-found, writes forbidden, anonymous writes
@@ -36,10 +46,12 @@
 
 pub mod gate;
 pub mod resolver;
+pub mod role;
 pub mod storage;
 pub mod types;
 
 pub use gate::{GateDenial, TenantGate, TenantTagged};
 pub use resolver::{ClaimTenantResolver, SingleTenantResolver, TenantResolver};
+pub use role::{TenantRole, UnknownRole};
 pub use storage::{Scoped, TenantBoundary, TenantScopedStore, Tenanted};
 pub use types::{Tenant, TenantError, TenantId};
