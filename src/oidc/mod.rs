@@ -58,7 +58,7 @@ pub(crate) mod jwks;
 pub mod session;
 pub mod validator;
 
-pub use config::{Audience, AudienceError, OidcConfig};
+pub use config::{Audience, AudienceClaim, AudienceError, OidcConfig};
 pub use fetch::{FetchError, FetchedDocument, JwksFetcher};
 #[cfg(feature = "oidc-reqwest")]
 pub use fetch::ReqwestJwksFetcher;

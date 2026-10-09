@@ -11,7 +11,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::auth::AuthContext;
-use crate::oidc::config::OidcConfig;
+use crate::oidc::config::{AudienceClaim, OidcConfig};
 use crate::oidc::fetch::JwksFetcher;
 use crate::oidc::jwks;
 use crate::tenant::types::{TenantError, TenantId};
@@ -268,11 +268,28 @@ impl OidcValidator {
         // are accepted; any other issuer fails.
         let issuer_str = self.config.issuer().as_url().as_str();
         validation.set_issuer(&[issuer_str, issuer_str.trim_end_matches('/')]);
-        validation.set_audience(&[self.config.audience().as_str()]);
-        validation.set_required_spec_claims(&["sub", "exp", "iss", "aud"]);
+        match self.config.audience_claim() {
+            AudienceClaim::Aud => {
+                validation.set_audience(&[self.config.audience().as_str()]);
+                validation.set_required_spec_claims(&["sub", "exp", "iss", "aud"]);
+            }
+            AudienceClaim::ClientId => {
+                // IDENTITY-30: no `aud` to check; `client_id` is, below.
+                validation.validate_aud = false;
+                validation.set_required_spec_claims(&["sub", "exp", "iss"]);
+            }
+        }
 
         let data = decode::<OidcClaims>(token, &key, &validation).map_err(map_jwt_error)?;
         let claims = data.claims;
+
+        // ── client_id: the audience, where the provider names it there
+        //    (WorkOS); absent or another client's ⇒ reject. ─────────────
+        if self.config.audience_claim() == AudienceClaim::ClientId
+            && claims.extra.get("client_id").and_then(serde_json::Value::as_str) != Some(self.config.audience().as_str())
+        {
+            return Err(OidcError::WrongAudience);
+        }
 
         // ── iat: required by OidcClaims' non-optional field; must not be
         //    in the future (zero leeway, symmetric with exp). ───────────

@@ -64,6 +64,19 @@ impl fmt::Display for Audience {
     }
 }
 
+/// The claim a provider names a token's audience in (IDENTITY-30).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AudienceClaim {
+    /// `aud`, as OIDC and Auth0 mint it: the audience is one of its values.
+    #[default]
+    Aud,
+    /// `client_id`, as WorkOS mints its access tokens, which carry no
+    /// `aud`: the audience is the client the token was issued to, and must
+    /// equal it.
+    ClientId,
+}
+
 /// Configuration for an [`OidcValidator`](crate::oidc::OidcValidator).
 ///
 /// Names the single trusted issuer and the audience this backend expects
@@ -74,12 +87,27 @@ impl fmt::Display for Audience {
 pub struct OidcConfig {
     issuer: IssuerUrl,
     audience: Audience,
+    /// Where the audience is read from; `aud` unless the provider says
+    /// otherwise.
+    #[serde(default)]
+    audience_claim: AudienceClaim,
 }
 
 impl OidcConfig {
     /// Build a config from a validated issuer and audience.
     pub fn new(issuer: IssuerUrl, audience: Audience) -> Self {
-        Self { issuer, audience }
+        Self { issuer, audience, audience_claim: AudienceClaim::Aud }
+    }
+
+    /// The same config, reading the audience from `claim`.
+    pub fn with_audience_claim(mut self, claim: AudienceClaim) -> Self {
+        self.audience_claim = claim;
+        self
+    }
+
+    /// The claim the audience is read from.
+    pub fn audience_claim(&self) -> AudienceClaim {
+        self.audience_claim
     }
 
     /// The trusted issuer URL.
@@ -156,5 +184,18 @@ mod tests {
         let s = serde_json::to_string(&c).unwrap();
         let back: OidcConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn the_audience_claim_is_aud_unless_said() {
+        let c = OidcConfig::new(issuer("https://idp.example.com"), Audience::try_new("plexus:trak").unwrap());
+        assert_eq!(c.audience_claim(), AudienceClaim::Aud);
+        // a config serialized before IDENTITY-30 reads as `aud`
+        let old: OidcConfig =
+            serde_json::from_str(r#"{"issuer":"https://idp.example.com/","audience":"plexus:trak"}"#).unwrap();
+        assert_eq!(old, c);
+        let w = c.with_audience_claim(AudienceClaim::ClientId);
+        let back: OidcConfig = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert_eq!(back.audience_claim(), AudienceClaim::ClientId);
     }
 }

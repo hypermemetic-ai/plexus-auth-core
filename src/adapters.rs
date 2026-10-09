@@ -14,6 +14,7 @@
 //! | --- | --- | --- |
 //! | plexus-idp | [`OidcAdapter`], plexus-idp profile | `idp:<uuid>` |
 //! | Auth0, Logto, any OIDC | [`OidcAdapter`], `auth0` or `generic` profile | `oidc:<provider>/<sub>` |
+//! | WorkOS (AuthKit, SSO) | [`OidcAdapter`], `workos` profile | `oidc:workos/<user id>` |
 //! | a nostr key | [`Nip98Adapter`] | `nostr:<hex>` |
 //!
 //! [`Carriers`] puts a chain of adapters at a WebSocket upgrade: a
@@ -33,7 +34,7 @@ use crate::identity::{
     Authenticated, Authenticator, AuthenticatorChain, AuthnRejection, Issuer, Presentation,
     Principal,
 };
-use crate::oidc::{Audience, OidcConfig, OidcError, OidcValidator, VerifiedToken};
+use crate::oidc::{Audience, AudienceClaim, OidcConfig, OidcError, OidcValidator, VerifiedToken};
 use crate::IssuerUrl;
 
 // ── Names and errors ───────────────────────────────────────────────────
@@ -95,6 +96,9 @@ impl fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 // ── OIDC ───────────────────────────────────────────────────────────────
+
+/// WorkOS's API, the base of its per-client issuers.
+pub const WORKOS_API: &str = "https://api.workos.com";
 
 /// Where a provider's token puts the facts Plexus needs.
 #[derive(Debug, Clone, Default)]
@@ -177,6 +181,32 @@ impl OidcAdapter {
         )
     }
 
+    /// The WorkOS profile over a validator (IDENTITY-30): principal
+    /// `oidc:workos/<user id>`, roles from `roles` (the organization
+    /// membership's). WorkOS's access token names nobody, so the name is the
+    /// user id unless a later token carries `email`; a login flow names the
+    /// person from the authenticate response instead.
+    pub fn workos_with(validator: OidcValidator) -> Self {
+        Self::with_validator(
+            ProviderName("workos".into()),
+            Namespace::Oidc(ProviderName("workos".into())),
+            ClaimMap { name: vec!["email".into()], roles: None },
+            validator,
+        )
+    }
+
+    /// The validator configuration for one WorkOS environment's client: the
+    /// issuer is `<base>/user_management/<client_id>` (base
+    /// `https://api.workos.com` unless given), which publishes discovery;
+    /// its access tokens carry no `aud`, so the audience is the client id,
+    /// read from `client_id`. A token for another client of the same
+    /// account fails both checks.
+    pub fn workos_config(client_id: &str, base: Option<&str>) -> Result<OidcConfig, AdapterError> {
+        let base = base.unwrap_or(WORKOS_API).trim_end_matches('/');
+        let issuer = format!("{base}/user_management/{client_id}");
+        Ok(Self::config(&issuer, client_id)?.with_audience_claim(AudienceClaim::ClientId))
+    }
+
     /// The validator configuration for `issuer` and `audience`.
     pub fn config(issuer: &str, audience: &str) -> Result<OidcConfig, AdapterError> {
         let url = issuer.parse().map_err(|_| AdapterError::Issuer(issuer.to_string()))?;
@@ -196,6 +226,13 @@ impl OidcAdapter {
     #[cfg(feature = "oidc-reqwest")]
     pub fn auth0(domain: &str, audience: &str, roles_claim: Option<&str>) -> Result<Self, AdapterError> {
         Ok(Self::auth0_with(OidcValidator::new(Self::config(domain, audience)?), roles_claim))
+    }
+
+    /// A WorkOS environment's client (`client_01…`), at `base` when it is
+    /// not `https://api.workos.com`.
+    #[cfg(feature = "oidc-reqwest")]
+    pub fn workos(client_id: &str, base: Option<&str>) -> Result<Self, AdapterError> {
+        Ok(Self::workos_with(OidcValidator::new(Self::workos_config(client_id, base)?)))
     }
 
     /// Any other OIDC provider, named `provider`, with its own claim map.

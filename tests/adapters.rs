@@ -16,7 +16,7 @@ use nostr::nips::nip19::ToBech32;
 use serde_json::json;
 
 use plexus_auth_core::adapters::{Carriers, Nip98Adapter, OidcAdapter};
-use plexus_auth_core::identity::{AuthenticatorChain, Issuer, Principal};
+use plexus_auth_core::identity::{Authenticator, AuthenticatorChain, Issuer, Presentation, Principal};
 use plexus_auth_core::oidc::{FetchError, FetchedDocument, JwksFetcher, OidcValidator};
 use plexus_auth_core::{AuthContext, SessionValidator};
 
@@ -100,7 +100,9 @@ struct Fixture {
 impl JwksFetcher for Fixture {
     async fn fetch(&self, url: &url::Url) -> Result<FetchedDocument, FetchError> {
         let base = self.issuer.trim_end_matches('/');
-        match url.path() {
+        // An issuer may have a path (WorkOS's per-client issuer does).
+        let path = url.path().strip_prefix(url::Url::parse(base).unwrap().path().trim_end_matches('/')).unwrap_or("");
+        match path {
             "/.well-known/openid-configuration" => Ok(FetchedDocument {
                 body: json!({ "issuer": self.issuer, "jwks_uri": format!("{base}/jwks.json") }).to_string(),
                 cache_control: None,
@@ -265,7 +267,7 @@ async fn a_login_endpoint_takes_post_events_and_refuses_get_ones() {
     let adapter = Nip98Adapter::new([url]).unwrap().for_method("POST");
     let keys = Keys::generate();
     let t = now() as u64;
-    let bearer = |m: &str| plexus_auth_core::identity::Presentation::Bearer { token: nip98(&keys, url, m, t) };
+    let bearer = |m: &str| Presentation::Bearer { token: nip98(&keys, url, m, t) };
     use plexus_auth_core::identity::Authenticator;
     assert!(adapter.authenticate(&bearer("GET")).await.is_err(), "GET is not this endpoint's method");
     assert!(adapter.authenticate(&bearer("post")).await.is_ok(), "POST, in any case");
@@ -276,4 +278,77 @@ async fn an_oidc_identity_carries_its_token_s_expiry() {
     let ctx = boundary().validate(&idp_token()).await.expect("admitted");
     let exp = ctx.metadata["expires_at"].as_i64().expect("expires_at");
     assert!((exp - (now() + 600)).abs() <= 2, "{exp}");
+}
+
+// ── IDENTITY-30: WorkOS ────────────────────────────────────────────────
+//
+// Shaped like the access token a real staging sign-in returned
+// (2026-10-09): the issuer is per client, there is no `aud`, the client is
+// named in `client_id`, and the token lives five minutes.
+
+const WORKOS_BASE: &str = "http://127.0.0.1:4490";
+const WORKOS_CLIENT: &str = "client_01M4GRE0HND6SKGPV780GPTYDX";
+const WORKOS_OTHER: &str = "client_01OTHERCLIENT0000000000000";
+
+fn workos_issuer(client: &str) -> String {
+    format!("{WORKOS_BASE}/user_management/{client}")
+}
+
+fn adapter_workos() -> OidcAdapter {
+    let config = OidcAdapter::workos_config(WORKOS_CLIENT, Some(WORKOS_BASE)).unwrap();
+    let issuer: &'static str = Box::leak(workos_issuer(WORKOS_CLIENT).into_boxed_str());
+    let fetcher = Arc::new(Fixture { issuer, jwk: JWK_1 });
+    OidcAdapter::workos_with(OidcValidator::with_fetcher(config, fetcher))
+}
+
+fn workos_token(iss: &str, client_id: Option<&str>) -> String {
+    let mut claims = json!({
+        "iss": iss, "sub": "user_01M4GS8A1YTZ8SD864JTME6VME", "sid": "session_01M4GSFNF96RHC4Y9GQ04YYTJ8",
+        "jti": "01M4GSFNJ3STHBMC80JZD4XWWC", "auth_time": now() - 5, "org_id": "org_01M4GRE0C2WPYY2VDRPC6BXZWC",
+        "role": "member", "roles": ["member"], "permissions": [], "exp": now() + 300, "iat": now() - 5,
+    });
+    if let Some(c) = client_id {
+        claims["client_id"] = json!(c);
+    }
+    mint("acme-1", KEY_1_PEM, claims)
+}
+
+#[tokio::test]
+async fn a_workos_token_becomes_a_workos_principal() {
+    let ctx = adapter_workos()
+        .authenticate(&Presentation::Bearer {
+            token: workos_token(&workos_issuer(WORKOS_CLIENT), Some(WORKOS_CLIENT)),
+        })
+        .await
+        .expect("admitted")
+        .into_auth_context();
+    assert_eq!(ctx.principal().unwrap().to_string(), "oidc:workos/user_01M4GS8A1YTZ8SD864JTME6VME");
+    assert_eq!(ctx.roles, vec!["member"]);
+    assert_eq!(ctx.session_id, "session_01M4GSFNF96RHC4Y9GQ04YYTJ8", "the WorkOS session, for signing out");
+    assert_eq!(ctx.tenant_id().unwrap().as_str(), "org_01M4GRE0C2WPYY2VDRPC6BXZWC");
+    assert_eq!(meta(&ctx, "provider"), "workos");
+    assert_eq!(meta(&ctx, "name"), "user_01M4GS8A1YTZ8SD864JTME6VME", "the token names nobody");
+}
+
+#[tokio::test]
+async fn a_workos_token_for_another_client_or_none_is_refused() {
+    let a = adapter_workos();
+    let present = |token: String| Presentation::Bearer { token };
+    // this client's issuer, another client named: refused, though signed
+    let other = a.authenticate(&present(workos_token(&workos_issuer(WORKOS_CLIENT), Some(WORKOS_OTHER)))).await;
+    assert!(other.is_err(), "another client's token");
+    // no client named at all
+    let none = a.authenticate(&present(workos_token(&workos_issuer(WORKOS_CLIENT), None))).await;
+    assert!(none.is_err(), "a token naming no client");
+    // another client's issuer: not this adapter's to claim
+    let p = present(workos_token(&workos_issuer(WORKOS_OTHER), Some(WORKOS_OTHER)));
+    assert!(!a.accepts(&p), "another client's issuer is someone else's token");
+}
+
+#[test]
+fn the_workos_issuer_is_per_client_on_the_api() {
+    let c = OidcAdapter::workos_config(WORKOS_CLIENT, None).unwrap();
+    assert_eq!(c.issuer().as_url().as_str(), format!("https://api.workos.com/user_management/{WORKOS_CLIENT}"));
+    assert_eq!(c.audience().as_str(), WORKOS_CLIENT);
+    assert_eq!(c.audience_claim(), plexus_auth_core::oidc::AudienceClaim::ClientId);
 }
