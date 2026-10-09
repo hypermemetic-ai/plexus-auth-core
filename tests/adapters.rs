@@ -258,3 +258,22 @@ fn an_oidc_principal_has_one_rendering() {
     assert!("oidc:auth0".parse::<Principal>().is_err(), "no provider/subject split");
     assert!(format!("idp:{ALICE}").parse::<Principal>().is_ok(), "idp still parses");
 }
+
+#[tokio::test]
+async fn a_login_endpoint_takes_post_events_and_refuses_get_ones() {
+    let url = "http://127.0.0.1:4451/login/nostr";
+    let adapter = Nip98Adapter::new([url]).unwrap().for_method("POST");
+    let keys = Keys::generate();
+    let t = now() as u64;
+    let bearer = |m: &str| plexus_auth_core::identity::Presentation::Bearer { token: nip98(&keys, url, m, t) };
+    use plexus_auth_core::identity::Authenticator;
+    assert!(adapter.authenticate(&bearer("GET")).await.is_err(), "GET is not this endpoint's method");
+    assert!(adapter.authenticate(&bearer("post")).await.is_ok(), "POST, in any case");
+}
+
+#[tokio::test]
+async fn an_oidc_identity_carries_its_token_s_expiry() {
+    let ctx = boundary().validate(&idp_token()).await.expect("admitted");
+    let exp = ctx.metadata["expires_at"].as_i64().expect("expires_at");
+    assert!((exp - (now() + 600)).abs() <= 2, "{exp}");
+}

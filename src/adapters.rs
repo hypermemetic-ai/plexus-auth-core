@@ -246,6 +246,9 @@ impl OidcAdapter {
         meta.insert("username".into(), Value::String(name));
         meta.insert("provider".into(), Value::String(self.provider.to_string()));
         meta.insert("auth_method".into(), Value::String("oidc".into()));
+        // IDENTITY-19: when the credential ends, so a service can stop
+        // honouring an identity its token no longer vouches for.
+        meta.insert("expires_at".into(), Value::from(token.user().expires_at()));
         if let Some(t) = token.tenant_id() {
             meta.insert("org_id".into(), Value::String(t.as_str().to_string()));
             meta.insert("tenant_id".into(), Value::String(t.as_str().to_string()));
@@ -319,9 +322,12 @@ const WINDOW_FUTURE_SECS: u64 = 30;
 ///
 /// At a WebSocket upgrade the event's `u` is the service's URL and its
 /// `method` is GET (in any case: nostr-tools' examples write it
-/// lowercase). Each event works once, within its window.
+/// lowercase). Each event works once, within its window. IDENTITY-19:
+/// [`Nip98Adapter::for_method`] takes another method, as a login endpoint
+/// that is POSTed to does.
 pub struct Nip98Adapter {
     urls: Vec<url::Url>,
+    method: String,
     roles: HashMap<String, Vec<String>>,
     seen: Mutex<HashMap<String, u64>>,
 }
@@ -337,7 +343,13 @@ impl Nip98Adapter {
             .into_iter()
             .map(|u| url::Url::parse(u.as_ref()).map_err(|_| AdapterError::ServiceUrl(u.as_ref().to_string())))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { urls, roles: HashMap::new(), seen: Mutex::new(HashMap::new()) })
+        Ok(Self { urls, method: "GET".into(), roles: HashMap::new(), seen: Mutex::new(HashMap::new()) })
+    }
+
+    /// Events must name `method` (in any case) instead of GET.
+    pub fn for_method(mut self, method: &str) -> Self {
+        self.method = method.to_ascii_uppercase();
+        self
     }
 
     /// Give the key `pubkey_hex` these roles. Keys not named here have none.
@@ -391,8 +403,8 @@ impl Authenticator for Nip98Adapter {
         if !u.as_ref().is_some_and(|u| self.urls.contains(u)) {
             return Err(AuthnRejection::Malformed("NIP-98: `u` is not this service".into()));
         }
-        if !tag("method").is_some_and(|m| m.eq_ignore_ascii_case("GET")) {
-            return Err(AuthnRejection::Malformed("NIP-98: `method` is not GET".into()));
+        if !tag("method").is_some_and(|m| m.eq_ignore_ascii_case(&self.method)) {
+            return Err(AuthnRejection::Malformed(format!("NIP-98: `method` is not {}", self.method)));
         }
         let now = nostr::types::Timestamp::now().as_secs();
         let at = event.created_at.as_secs();
