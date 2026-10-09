@@ -124,6 +124,11 @@ struct OidcClaims {
     /// Plexus extension; optional for validation.
     #[serde(default)]
     username: Option<String>,
+    /// Every other claim, kept for provider adapters (IDENTITY-13): Auth0
+    /// puts roles under a namespaced claim, and names under `nickname`,
+    /// `name` or `email`.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The OIDC discovery document fields the validator needs.
@@ -308,6 +313,7 @@ impl OidcValidator {
             roles: claims.roles.unwrap_or_default(),
             username: claims.username,
             session_id,
+            extra: claims.extra,
         })
     }
 
@@ -438,6 +444,8 @@ pub struct VerifiedToken {
     roles: Vec<String>,
     username: Option<String>,
     session_id: String,
+    /// Claims beyond the ones read above, verified with them.
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl VerifiedToken {
@@ -461,6 +469,14 @@ impl VerifiedToken {
     /// The `username` extension claim, if present.
     pub fn username(&self) -> Option<&str> {
         self.username.as_deref()
+    }
+
+    /// Any other verified claim by name: `nickname`, `email`, or a
+    /// provider's namespaced claim such as `https://menger.example/roles`.
+    /// The claims read into fields above (`sub`, `iss`, `exp`, `iat`,
+    /// `org_id`, `sid`, `jti`, `roles`, `username`) are not repeated here.
+    pub fn claim(&self, name: &str) -> Option<&serde_json::Value> {
+        self.extra.get(name)
     }
 
     /// The session identifier (`sid`, else `jti`, else the token's

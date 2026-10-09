@@ -119,6 +119,11 @@ pub mod scope_registry;
 pub mod tenant;
 pub mod verified_user;
 
+/// IDENTITY-13: provider adapters, one per identity provider, each turning
+/// its credential into Plexus types at a service's boundary.
+#[cfg(feature = "adapters")]
+pub mod adapters;
+
 pub mod forward;
 
 pub use audit::{
