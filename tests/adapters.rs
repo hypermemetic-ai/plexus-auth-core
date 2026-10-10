@@ -446,3 +446,185 @@ fn two_providers_of_one_name_are_refused() {
     let both = once.try_with(Arc::new(adapter_idp())).unwrap();
     assert!(Carriers::try_bearer_only(both).is_ok());
 }
+
+// ── IDENTITY-41: an agent's key proof ──────────────────────────────────
+
+mod key_proof {
+    use super::*;
+    use plexus_auth_core::adapters::{
+        key_principal, key_proof_message, sign_key_proof, valid_agent_id, KeyProofAdapter, KEY_PROOF_PREFIX,
+    };
+    use plexus_auth_core::identity::AuthnRejection;
+    use serde_json::Value;
+
+    const AUD: &str = "ws://127.0.0.1:4460";
+    const TS: i64 = 1_791_600_000;
+
+    /// The fixed vector's seed: bytes 0x01, 0x02, …, 0x20.
+    fn seed() -> [u8; 32] {
+        std::array::from_fn(|i| i as u8 + 1)
+    }
+
+    /// The fixed vector's proof, exactly as it goes on the wire — the
+    /// synapse side (IDENTITY-43) must produce these same bytes from the
+    /// same inputs: seed 0x01..0x20, aud `ws://127.0.0.1:4460`, agent
+    /// `worker-3`, nonce 32 bytes of 0x07, ts 1791600000.
+    const VECTOR: &str = "plexus-key.eyJ2IjoxLCJrZXkiOiI3OWI1NTYyZThmZTY1NGY5NDA3OGIxMTJlOGE5OGJhNzkwMWY4NTNhZTY5NWJlZDdlMGUzOTEwYmFkMDQ5NjY0IiwiYXVkIjoid3M6Ly8xMjcuMC4wLjE6NDQ2MCIsImFnZW50Ijoid29ya2VyLTMiLCJub25jZSI6IkJ3Y0hCd2NIQndjSEJ3Y0hCd2NIQndjSEJ3Y0hCd2NIQndjSEJ3Y0hCd2MiLCJ0cyI6MTc5MTYwMDAwMCwic2lnIjoiSlJxSGx6VEd2WGZubm8zQWlsMWhudU9wZ2J6SzlyNFZPa0l6OHNRbmpkVzZwWlk4S1h5YlR4QlBBcmdaclFkeFR1M3NvaWtwSkxRMURSaDN3SVFLQVEifQ";
+
+    fn adapter_at(now: i64) -> KeyProofAdapter {
+        KeyProofAdapter::new([AUD, "ws://localhost:4460"]).unwrap().with_clock(move || now)
+    }
+
+    fn bearer(token: String) -> Presentation {
+        Presentation::Bearer { token }
+    }
+
+    /// A proof's JSON, to tamper with.
+    fn json_of(proof: &str) -> Value {
+        let b = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(proof.strip_prefix(KEY_PROOF_PREFIX).unwrap()).unwrap();
+        serde_json::from_slice(&b).unwrap()
+    }
+
+    fn proof_of(json: &Value) -> String {
+        format!("{KEY_PROOF_PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(json).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn the_fixed_vector() {
+        let proof = sign_key_proof(&seed(), AUD, "worker-3", &[7u8; 32], TS);
+        println!("IDENTITY-41 fixed vector proof: {proof}");
+        let json = json_of(&proof);
+        let wire = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(proof.strip_prefix(KEY_PROOF_PREFIX).unwrap()).unwrap();
+        println!("IDENTITY-41 fixed vector JSON: {}", String::from_utf8(wire.clone()).unwrap());
+        assert_eq!(
+            String::from_utf8(wire).unwrap(),
+            r#"{"v":1,"key":"79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664","aud":"ws://127.0.0.1:4460","agent":"worker-3","nonce":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","ts":1791600000,"sig":"JRqHlzTGvXfnno3Ail1hnuOpgbzK9r4VOkIz8sQnjdW6pZY8KXybTxBPArgZrQdxTu3soikpJLQ1DRh3wIQKAQ"}"#,
+            "the JSON, in the wire's field order (checked against an independent Ed25519: Python's cryptography)"
+        );
+        println!("IDENTITY-41 fixed vector message: {:?}", key_proof_message(AUD, "worker-3", json["nonce"].as_str().unwrap(), TS));
+        assert_eq!(proof, VECTOR, "the wire bytes of the fixed vector");
+
+        let ok = adapter_at(TS).authenticate(&bearer(proof)).await.unwrap();
+        let key = json["key"].as_str().unwrap();
+        assert_eq!(ok.principal().to_string(), format!("key:{key}"));
+        assert_eq!(ok.principal().issuer(), Issuer::Key);
+        assert_eq!(ok.claims()["agent"], "worker-3");
+        assert_eq!(ok.claims()["name"], "worker-3");
+        assert_eq!(ok.claims()["provider"], "key");
+        assert_eq!(ok.claims()["auth_method"], "key");
+        assert_eq!(ok.claims()["expires_at"], TS + 300);
+        assert_eq!(json["nonce"], "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc");
+        let keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), 7);
+        let ctx = ok.into_auth_context();
+        assert_eq!(ctx.principal().unwrap().to_string(), format!("key:{key}"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_proof_opens_once_through_the_carriers() {
+        let now = system_now();
+        let carriers = Carriers::cookie_and_bearer(AuthenticatorChain::new().with(Arc::new(
+            KeyProofAdapter::new([AUD]).unwrap(),
+        )));
+        let proof = sign_key_proof(&seed(), AUD, "worker-3", &[1u8; 32], now);
+        let ctx = carriers.validate(&proof).await.expect("bearer");
+        assert_eq!(meta(&ctx, "name"), "worker-3");
+        assert!(carriers.validate(&proof).await.is_none(), "replayed");
+        let other = sign_key_proof(&seed(), AUD, "worker-3", &[2u8; 32], now);
+        assert!(carriers.validate(&format!("theme=dark; access_token={other}")).await.is_some(), "the access_token cookie");
+    }
+
+    fn system_now() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+    }
+
+    #[tokio::test]
+    async fn refusals() {
+        let a = adapter_at(TS);
+        let sign = |aud: &str, agent: &str, nonce: u8, ts: i64| sign_key_proof(&seed(), aud, agent, &[nonce; 32], ts);
+
+        // Replay: the same (key, nonce) twice.
+        let once = sign(AUD, "worker-3", 9, TS);
+        assert!(a.authenticate(&bearer(once.clone())).await.is_ok());
+        assert!(matches!(a.authenticate(&bearer(once)).await, Err(AuthnRejection::Malformed(m)) if m.contains("already used")));
+
+        // The window: −60 s / +30 s.
+        assert!(a.authenticate(&bearer(sign(AUD, "w", 10, TS - 60))).await.is_ok());
+        assert_eq!(a.authenticate(&bearer(sign(AUD, "w", 11, TS - 61))).await.unwrap_err(), AuthnRejection::Expired, "stale");
+        assert!(a.authenticate(&bearer(sign(AUD, "w", 12, TS + 30))).await.is_ok());
+        assert_eq!(a.authenticate(&bearer(sign(AUD, "w", 13, TS + 31))).await.unwrap_err(), AuthnRejection::Expired, "future");
+
+        // Another server's URL; the other configured one, and a trailing slash, are this one.
+        let e = a.authenticate(&bearer(sign("ws://127.0.0.1:4455", "w", 14, TS))).await.unwrap_err();
+        assert!(matches!(&e, AuthnRejection::Malformed(m) if m.contains("aud")), "{e}");
+        assert!(a.authenticate(&bearer(sign("ws://localhost:4460", "w", 15, TS))).await.is_ok());
+        assert!(a.authenticate(&bearer(sign("ws://127.0.0.1:4460/", "w", 16, TS))).await.is_ok());
+
+        // Signed by another key: the key named is not the signer's.
+        let mut forged = json_of(&sign(AUD, "w", 17, TS));
+        let other = sign_key_proof(&[42u8; 32], AUD, "w", &[17; 32], TS);
+        forged["key"] = json_of(&other)["key"].clone();
+        assert_eq!(a.authenticate(&bearer(proof_of(&forged))).await.unwrap_err(), AuthnRejection::SignatureInvalid);
+        // A signature over another message: the agent changed after signing.
+        let mut changed = json_of(&sign(AUD, "worker-3", 18, TS));
+        changed["agent"] = "worker-4".into();
+        assert_eq!(a.authenticate(&bearer(proof_of(&changed))).await.unwrap_err(), AuthnRejection::SignatureInvalid);
+        // A forgery does not burn the nonce: the real proof still opens.
+        assert!(a.authenticate(&bearer(sign(AUD, "w", 17, TS))).await.is_ok());
+
+        // Bad agent ids.
+        for agent in ["", "has space", "slash/no", "colon:no", &"a".repeat(65), "é"] {
+            let e = a.authenticate(&bearer(sign(AUD, agent, 19, TS))).await.unwrap_err();
+            assert!(matches!(&e, AuthnRejection::Malformed(m) if m.contains("agent")), "{agent:?}: {e}");
+        }
+        assert!(valid_agent_id(&"a".repeat(64)) && valid_agent_id("A.b_c-9"));
+
+        // Shape: v, nonce length, uppercase key, padding, garbage.
+        let mut v2 = json_of(&sign(AUD, "w", 20, TS));
+        v2["v"] = 2.into();
+        assert!(a.authenticate(&bearer(proof_of(&v2))).await.is_err());
+        let mut short = json_of(&sign(AUD, "w", 21, TS));
+        short["nonce"] = "BwcH".into();
+        assert!(matches!(a.authenticate(&bearer(proof_of(&short))).await, Err(AuthnRejection::Malformed(m)) if m.contains("nonce")));
+        let mut upper = json_of(&sign(AUD, "w", 22, TS));
+        upper["key"] = upper["key"].as_str().unwrap().to_uppercase().into();
+        assert!(a.authenticate(&bearer(proof_of(&upper))).await.is_err());
+        let padded = format!("{}==", sign(AUD, "w", 23, TS));
+        assert!(a.authenticate(&bearer(padded)).await.is_err(), "nopad only");
+        assert!(matches!(a.authenticate(&bearer("plexus-key.garbage".into())).await, Err(AuthnRejection::Malformed(_))));
+        // Not a proof at all: not this adapter's.
+        assert!(a.authenticate(&bearer("eyJhbGciOi.x.y".into())).await.unwrap_err().is_unsupported());
+    }
+
+    #[tokio::test]
+    async fn a_signed_challenge_carries_the_same_proof() {
+        let a = adapter_at(TS);
+        let json = json_of(&sign_key_proof(&seed(), AUD, "worker-3", &[30u8; 32], TS));
+        let challenge = key_proof_message(AUD, "worker-3", json["nonce"].as_str().unwrap(), TS);
+        let p = Presentation::SignedChallenge {
+            scheme: "ed25519".into(),
+            key_id: json["key"].as_str().unwrap().into(),
+            challenge: challenge.clone(),
+            signature: json["sig"].as_str().unwrap().into(),
+        };
+        assert_eq!(a.authenticate(&p).await.unwrap().claims()["agent"], "worker-3");
+        assert!(a.authenticate(&p).await.is_err(), "once");
+        let nip42 = Presentation::SignedChallenge { scheme: "nip42".into(), key_id: String::new(), challenge, signature: String::new() };
+        assert!(a.authenticate(&nip42).await.unwrap_err().is_unsupported());
+    }
+
+    #[test]
+    fn an_audience_is_a_websocket_url() {
+        assert!(KeyProofAdapter::new(["http://127.0.0.1:4460"]).is_err());
+        assert!(KeyProofAdapter::new(["not a url"]).is_err());
+        let a = KeyProofAdapter::new(["ws://127.0.0.1:4460/", "ws://127.0.0.1:4460", "wss://menger.example"]).unwrap();
+        assert_eq!(a.audiences(), ["ws://127.0.0.1:4460", "wss://menger.example"]);
+    }
+
+    #[test]
+    fn a_key_principal_is_its_public_key_in_hex() {
+        let p = key_principal(&[0xab; 32]);
+        assert_eq!(p.to_string(), format!("key:{}", "ab".repeat(32)));
+        assert_eq!(p.to_string().parse::<Principal>().unwrap(), p);
+    }
+}

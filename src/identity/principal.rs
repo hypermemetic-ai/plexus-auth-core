@@ -51,6 +51,10 @@ pub enum Issuer {
     /// provider adapter: `oidc:<provider>/<sub>` (IDENTITY-13). The provider
     /// is the adapter's configured name (`auth0`), never the issuer URL.
     Oidc,
+    /// An Ed25519 public key an agent holds (IDENTITY-41): `key:<64 hex>`,
+    /// the 32-byte key in lowercase hex. A key proof (`plexus-key.…`,
+    /// `adapters::KeyProofAdapter`) proves it.
+    Key,
 }
 
 impl Issuer {
@@ -61,6 +65,7 @@ impl Issuer {
             Self::Nostr => "nostr",
             Self::ApiKey => "apikey",
             Self::Oidc => "oidc",
+            Self::Key => "key",
         }
     }
 
@@ -71,6 +76,7 @@ impl Issuer {
             "nostr" => Ok(Self::Nostr),
             "apikey" => Ok(Self::ApiKey),
             "oidc" => Ok(Self::Oidc),
+            "key" => Ok(Self::Key),
             other => Err(PrincipalParseError::UnknownIssuer(other.to_string())),
         }
     }
@@ -102,24 +108,15 @@ impl Issuer {
             // nostr implementation uses. Uppercase is rejected rather than
             // normalized: normalizing would break the exact round-trip and
             // give one key two principals.
-            Self::Nostr => {
-                if subject.len() != 64 {
-                    return Err(PrincipalParseError::InvalidNostrPubkey {
-                        subject: subject.to_string(),
-                        reason: "expected exactly 64 hex characters",
-                    });
-                }
-                if !subject
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                {
-                    return Err(PrincipalParseError::InvalidNostrPubkey {
-                        subject: subject.to_string(),
-                        reason: "expected lowercase hex only",
-                    });
-                }
-                Ok(())
-            }
+            Self::Nostr => lower_hex_64(subject).map_err(|reason| {
+                PrincipalParseError::InvalidNostrPubkey { subject: subject.to_string(), reason }
+            }),
+
+            // IDENTITY-41: the Ed25519 public key, 64 lowercase hex
+            // characters — uppercase refused for the same reason as nostr's.
+            Self::Key => lower_hex_64(subject).map_err(|reason| {
+                PrincipalParseError::InvalidKeyPubkey { subject: subject.to_string(), reason }
+            }),
 
             // An opaque key id. Constrained to printable, non-whitespace ASCII
             // so a principal is always safely renderable in a log line, a URL
@@ -160,6 +157,17 @@ impl Issuer {
             }
         }
     }
+}
+
+/// 64 lowercase hex characters (a 32-byte key), or which rule broke.
+fn lower_hex_64(subject: &str) -> Result<(), &'static str> {
+    if subject.len() != 64 {
+        return Err("expected exactly 64 hex characters");
+    }
+    if !subject.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("expected lowercase hex only");
+    }
+    Ok(())
 }
 
 /// An OIDC adapter's provider name: 1–32 of `a-z`, `0-9` and `-`.
@@ -221,6 +229,16 @@ pub enum PrincipalParseError {
         /// Which rule it broke.
         reason: &'static str,
     },
+
+    /// `key:` subject was not a 64-character lowercase hex Ed25519 public
+    /// key (IDENTITY-41). Added after the enum was pinned exhaustive, as
+    /// `InvalidOidcSubject` was.
+    InvalidKeyPubkey {
+        /// The rejected subject.
+        subject: String,
+        /// Which rule it broke.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for PrincipalParseError {
@@ -232,7 +250,7 @@ impl fmt::Display for PrincipalParseError {
             ),
             Self::UnknownIssuer(s) => write!(
                 f,
-                "unknown principal issuer `{s}`; known issuers: idp, nostr, apikey, oidc"
+                "unknown principal issuer `{s}`; known issuers: idp, nostr, apikey, oidc, key"
             ),
             Self::EmptySubject(i) => write!(f, "principal issuer `{i}` has an empty subject"),
             Self::SubjectContainsSeparator(i) => write!(
@@ -252,6 +270,10 @@ impl fmt::Display for PrincipalParseError {
             Self::InvalidOidcSubject { subject, reason } => write!(
                 f,
                 "principal subject `{subject}` is not a valid oidc subject: {reason}"
+            ),
+            Self::InvalidKeyPubkey { subject, reason } => write!(
+                f,
+                "principal subject `{subject}` is not a valid Ed25519 public key: {reason}"
             ),
         }
     }
@@ -735,6 +757,28 @@ mod tests {
                 "{s:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn a_key_principal_is_64_lowercase_hex_and_round_trips() {
+        let s = format!("key:{PUBKEY}");
+        let p: Principal = s.parse().unwrap();
+        assert_eq!(p.issuer(), Issuer::Key);
+        assert_eq!(p.subject(), PUBKEY);
+        assert_eq!(p.to_string(), s);
+        assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{s}\""));
+        assert_eq!(serde_json::from_str::<Principal>(&format!("\"{s}\"")).unwrap(), p);
+        assert_eq!(p.as_legacy_user_id(), s, "keeps its namespace");
+        assert_ne!(p, Principal::new(Issuer::Nostr, PUBKEY).unwrap(), "one key, two issuers: two principals");
+        match format!("key:{}", PUBKEY.to_uppercase()).parse::<Principal>() {
+            Err(PrincipalParseError::InvalidKeyPubkey { reason, .. }) => assert_eq!(reason, "expected lowercase hex only"),
+            other => panic!("uppercase must be refused: {other:?}"),
+        }
+        for bad in [&PUBKEY[..63], &format!("{PUBKEY}0")[..], "", "zz"] {
+            assert!(format!("key:{bad}").parse::<Principal>().is_err(), "{bad}");
+        }
+        assert!(format!("key:{PUBKEY}:x").parse::<Principal>().is_err());
+        assert!(format!("KEY:{PUBKEY}").parse::<Principal>().is_err());
     }
 
     #[test]
