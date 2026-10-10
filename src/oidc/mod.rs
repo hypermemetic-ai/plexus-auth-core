@@ -12,7 +12,7 @@
 //!    `kid`, and caches per the AUTH-8 policy (see "Caching policy").
 //! 4. It validates the **RS256** signature plus the standard claims:
 //!    `iss` (== configured issuer), `aud` (== configured audience),
-//!    `exp`/`iat` (zero leeway — no grace), `sub` present.
+//!    `exp`/`nbf`/`iat` (zero leeway — no grace), `sub` present.
 //! 5. On success it mints the sealed
 //!    [`VerifiedUser`](crate::VerifiedUser) — the only production call
 //!    site of `VerifiedUser::new_sealed` — carrying the
@@ -32,9 +32,12 @@
 //! | Condition | Behavior |
 //! |---|---|
 //! | JWKS fetch succeeds | cache keys; TTL = min(`Cache-Control: max-age`, 3600 s); default 3600 s |
-//! | Token `kid` not in cache | exactly **one** unconditional refresh, then reject (`UnknownKeyId`) |
+//! | JWKS `max-age` below 60 s | TTL floored at 60 s (IDENTITY-27) — `max-age=0` cannot make every validation a fetch |
+//! | Token `kid` not in cache | one refresh, then reject (`UnknownKeyId`) — at most one such refresh per 60 s per validator, and concurrent refreshes coalesce into one (IDENTITY-27) |
 //! | IdP unreachable, cache present | keep validating with cached keys (degraded) — usable only for tokens whose `exp` is in the future, because `exp` is enforced with **zero grace** regardless |
 //! | IdP unreachable, no cache | reject (`JwksUnavailable` / `Discovery`) |
+//! | Discovery names a `jwks_uri` | trusted only if `https`, or on the issuer's own origin (IDENTITY-27) |
+//! | Fetched documents | at most 1 MiB, no redirects followed (`ReqwestJwksFetcher`, IDENTITY-27) |
 //! | Degradation transitions | `auth_provider_degraded` / `auth_provider_restored` events under `target = "plexus::auth"` |
 //!
 //! # Algorithm posture

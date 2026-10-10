@@ -381,6 +381,16 @@ impl AuthenticatorChain {
         self
     }
 
+    /// Append an authenticator, refusing one whose name the chain already
+    /// holds (IDENTITY-27): two providers of one name would mint one
+    /// namespace. The error is the repeated name.
+    pub fn try_with(self, authenticator: Arc<dyn Authenticator>) -> Result<Self, String> {
+        if self.names().contains(&authenticator.name()) {
+            return Err(authenticator.name().to_string());
+        }
+        Ok(self.with(authenticator))
+    }
+
     /// The names of the registered authenticators, in order.
     pub fn names(&self) -> Vec<&str> {
         self.authenticators.iter().map(|a| a.name()).collect()

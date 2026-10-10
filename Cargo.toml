@@ -56,7 +56,7 @@ oidc-reqwest = ["dep:reqwest"]
 # profiles (plexus-idp, Auth0, generic) with the reqwest fetcher, and the
 # nostr NIP-98 adapter. Off by default; a service that admits callers
 # through adapters turns it on.
-adapters = ["oidc-reqwest", "dep:nostr", "dep:base64"]
+adapters = ["oidc-reqwest", "dep:nostr", "dep:base64", "dep:sha2"]
 
 [dependencies]
 # Serialization. Note: Deserialize is intentionally implemented in a way that
@@ -110,12 +110,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # base64 reads them, and a JWT's unverified `iss` for routing.
 nostr = { version = "0.45", default-features = false, features = ["std"], optional = true }
 base64 = { version = "0.22", optional = true }
+# IDENTITY-27: a NIP-98 `payload` tag is the SHA-256 of the request body.
+sha2 = { version = "0.10", optional = true }
+
+# IDENTITY-27: the validator's JWKS refresh is single-flight — concurrent
+# callers wait on one async lock instead of each fetching.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
 # Principal cannot be constructed from outside this crate.
 trybuild = "1.0"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }
 
 # AUTHZ-PRIVACY-1: assert `TracingAuditSink` emits to the `plexus::audit`
 # target. `tracing-test` captures span/event output for in-test assertions.

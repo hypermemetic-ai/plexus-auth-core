@@ -352,3 +352,97 @@ fn the_workos_issuer_is_per_client_on_the_api() {
     assert_eq!(c.audience().as_str(), WORKOS_CLIENT);
     assert_eq!(c.audience_claim(), plexus_auth_core::oidc::AudienceClaim::ClientId);
 }
+
+// ── IDENTITY-27 ────────────────────────────────────────────────────────
+
+fn nip98_with(keys: &Keys, u: &str, method: &str, payload: Option<&str>) -> String {
+    let tag = |t: &[&str]| Tag::parse(t.iter().copied()).unwrap();
+    let mut tags = vec![tag(&["u", u]), tag(&["method", method])];
+    if let Some(p) = payload {
+        tags.push(tag(&["payload", p]));
+    }
+    let event = EventBuilder::new(Kind::HttpAuth, "")
+        .tags(tags)
+        .custom_created_at(nostr::types::Timestamp::from_secs(now() as u64))
+        .finalize(keys)
+        .unwrap();
+    base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&event).unwrap())
+}
+
+#[tokio::test]
+async fn a_nostr_identity_carries_an_expiry() {
+    use plexus_auth_core::adapters::NIP98_DEFAULT_LIFETIME_SECS;
+    let keys = Keys::generate();
+    let ctx = boundary().validate(&nip98(&keys, SERVICE, "GET", now() as u64)).await.expect("admitted");
+    let exp = ctx.metadata["expires_at"].as_i64().expect("expires_at");
+    assert!((exp - (now() + NIP98_DEFAULT_LIFETIME_SECS as i64)).abs() <= 2, "{exp}");
+
+    let short = Nip98Adapter::new([SERVICE]).unwrap().with_lifetime(300);
+    let a = short
+        .authenticate(&Presentation::Bearer { token: nip98(&keys, SERVICE, "GET", now() as u64) })
+        .await
+        .expect("admitted");
+    let exp = a.into_auth_context().metadata["expires_at"].as_i64().unwrap();
+    assert!((exp - (now() + 300)).abs() <= 2, "{exp}");
+}
+
+#[tokio::test]
+async fn a_nostr_payload_tag_binds_the_body() {
+    use sha2::Digest;
+    let url = "http://127.0.0.1:4451/login/nostr";
+    let adapter = Nip98Adapter::new([url]).unwrap().for_method("POST");
+    let keys = Keys::generate();
+    let body = br#"{"next":"/"}"#;
+    let hash: String = sha2::Sha256::digest(body).iter().map(|b| format!("{b:02x}")).collect();
+    let empty: String = sha2::Sha256::digest(b"").iter().map(|b| format!("{b:02x}")).collect();
+
+    let t = nip98_with(&keys, url, "POST", Some(&hash));
+    assert!(adapter.authenticate_request(&t, body).await.is_ok(), "the body it names");
+    let t = nip98_with(&keys, url, "POST", Some(&hash));
+    assert!(adapter.authenticate_request(&t, b"{\"next\":\"/evil\"}").await.is_err(), "another body");
+    let t = nip98_with(&keys, url, "POST", None);
+    assert!(adapter.authenticate_request(&t, body).await.is_err(), "a body needs a payload tag");
+    let t = nip98_with(&keys, url, "POST", None);
+    assert!(adapter.authenticate_request(&t, b"").await.is_ok(), "no body, no tag");
+    let t = nip98_with(&keys, url, "POST", Some(&empty));
+    assert!(adapter.authenticate_request(&t, b"").await.is_ok(), "no body, the empty body's hash");
+}
+
+#[tokio::test]
+async fn bearer_only_carriers_read_no_cookie() {
+    let chain = || {
+        AuthenticatorChain::new()
+            .with(Arc::new(adapter_auth0()))
+            .with(Arc::new(Nip98Adapter::new([SERVICE]).unwrap()))
+    };
+    let b = Carriers::bearer_only(chain());
+    // A cookie another port of this host planted is not a credential…
+    let planted = format!("access_token={}", auth0_token(AUTH0_AUD));
+    assert!(b.validate(&planted).await.is_none(), "access_token cookie");
+    assert!(b.validate(&format!("theme=dark; {planted}")).await.is_none(), "among others");
+    let keys = Keys::generate();
+    let nostr = format!("nostr={}", nip98(&keys, SERVICE, "GET", now() as u64));
+    assert!(b.validate(&nostr).await.is_none(), "nostr cookie");
+    // …and never reaches an adapter: the same event still works once, as a bearer.
+    let event = nostr.strip_prefix("nostr=").unwrap();
+    assert!(b.validate(event).await.is_some(), "the event, as the bearer value");
+    // The bearer value is.
+    let ctx = b.validate(&auth0_token(AUTH0_AUD)).await.expect("bearer admitted");
+    assert_eq!(meta(&ctx, "provider"), "auth0");
+    // The cookie carriers still read it.
+    assert!(Carriers::cookie_and_bearer(chain()).validate(&planted).await.is_some());
+}
+
+#[test]
+fn two_providers_of_one_name_are_refused() {
+    use plexus_auth_core::adapters::AdapterError;
+    let twice = AuthenticatorChain::new()
+        .with(Arc::new(adapter_auth0()))
+        .with(Arc::new(adapter_auth0()));
+    assert!(matches!(Carriers::try_cookie_and_bearer(twice.clone()), Err(AdapterError::DuplicateProvider(n)) if n == "auth0"));
+    assert!(matches!(Carriers::try_bearer_only(twice), Err(AdapterError::DuplicateProvider(_))));
+    let once = AuthenticatorChain::new().try_with(Arc::new(adapter_auth0())).unwrap();
+    assert_eq!(once.clone().try_with(Arc::new(adapter_auth0())).unwrap_err(), "auth0");
+    let both = once.try_with(Arc::new(adapter_idp())).unwrap();
+    assert!(Carriers::try_bearer_only(both).is_ok());
+}
