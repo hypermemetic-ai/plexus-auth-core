@@ -52,6 +52,12 @@ test-support = []
 # UT-1 per UT-S01 D1.
 oidc-reqwest = ["dep:reqwest"]
 
+# IDENTITY-13: provider adapters (`src/adapters.rs`): the OIDC adapter's
+# profiles (plexus-idp, Auth0, generic) with the reqwest fetcher, and the
+# nostr NIP-98 adapter. Off by default; a service that admits callers
+# through adapters turns it on.
+adapters = ["oidc-reqwest", "dep:nostr", "dep:base64"]
+
 [dependencies]
 # Serialization. Note: Deserialize is intentionally implemented in a way that
 # documents the seal rather than offering a back-door. See module docs.
@@ -100,6 +106,11 @@ jsonwebtoken = "9"
 # linkage in this foundational crate.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
+# IDENTITY-13 (`adapters`): rust-nostr decodes and verifies NIP-98 events;
+# base64 reads them, and a JWT's unverified `iss` for routing.
+nostr = { version = "0.45", default-features = false, features = ["std"], optional = true }
+base64 = { version = "0.22", optional = true }
+
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
 # Principal cannot be constructed from outside this crate.
@@ -112,3 +123,10 @@ tokio = { version = "1", features = ["macros", "rt"] }
 # (a logical target), not the crate-derived target tracing-test filters on
 # by default.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
+# IDENTITY-13: the adapter tests sign NIP-98 events as a client would.
+nostr = { version = "0.45", default-features = false, features = ["std", "os-rng"] }
+
+[[test]]
+name = "adapters"
+required-features = ["adapters"]

@@ -47,6 +47,10 @@ pub enum Issuer {
     Nostr,
     /// A machine credential minted as an API key.
     ApiKey,
+    /// A subject an OIDC provider other than plexus-idp vouches for, behind a
+    /// provider adapter: `oidc:<provider>/<sub>` (IDENTITY-13). The provider
+    /// is the adapter's configured name (`auth0`), never the issuer URL.
+    Oidc,
 }
 
 impl Issuer {
@@ -56,6 +60,7 @@ impl Issuer {
             Self::Idp => "idp",
             Self::Nostr => "nostr",
             Self::ApiKey => "apikey",
+            Self::Oidc => "oidc",
         }
     }
 
@@ -65,6 +70,7 @@ impl Issuer {
             "idp" => Ok(Self::Idp),
             "nostr" => Ok(Self::Nostr),
             "apikey" => Ok(Self::ApiKey),
+            "oidc" => Ok(Self::Oidc),
             other => Err(PrincipalParseError::UnknownIssuer(other.to_string())),
         }
     }
@@ -127,8 +133,40 @@ impl Issuer {
                 }
                 Ok(())
             }
+
+            // `<provider>/<sub>`: a provider name of 1–32 lowercase letters,
+            // digits and hyphens, then the provider's subject as
+            // `Principal::oidc` encoded it — printable ASCII with `:`, `%`,
+            // quotes and backslashes percent-encoded, so every subject a
+            // provider can mint has exactly one rendering.
+            Self::Oidc => {
+                let invalid = |reason: &'static str| PrincipalParseError::InvalidOidcSubject {
+                    subject: subject.to_string(),
+                    reason,
+                };
+                let (provider, sub) = subject
+                    .split_once('/')
+                    .ok_or_else(|| invalid("expected `<provider>/<sub>`"))?;
+                if !valid_provider_name(provider) {
+                    return Err(invalid("the provider name must be 1-32 of a-z, 0-9 and -"));
+                }
+                if sub.is_empty() {
+                    return Err(invalid("the provider's subject is empty"));
+                }
+                if sub.bytes().any(|b| !b.is_ascii_graphic() || b == b'"' || b == b'\\') {
+                    return Err(invalid("the provider's subject is not percent-encoded"));
+                }
+                Ok(())
+            }
         }
     }
+}
+
+/// An OIDC adapter's provider name: 1–32 of `a-z`, `0-9` and `-`.
+pub(crate) fn valid_provider_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 impl fmt::Display for Issuer {
@@ -171,6 +209,18 @@ pub enum PrincipalParseError {
 
     /// `apikey:` subject contained non-printable or quoting characters.
     InvalidApiKeyId(String),
+
+    /// `oidc:` subject was not `<provider>/<sub>` (IDENTITY-13).
+    ///
+    /// Added after the enum was pinned exhaustive for PLX-87's re-export: a
+    /// downstream `match` with no wildcard arm needs this arm. No crate in
+    /// the workspace has one.
+    InvalidOidcSubject {
+        /// The rejected subject.
+        subject: String,
+        /// Which rule it broke.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for PrincipalParseError {
@@ -182,7 +232,7 @@ impl fmt::Display for PrincipalParseError {
             ),
             Self::UnknownIssuer(s) => write!(
                 f,
-                "unknown principal issuer `{s}`; known issuers: idp, nostr, apikey"
+                "unknown principal issuer `{s}`; known issuers: idp, nostr, apikey, oidc"
             ),
             Self::EmptySubject(i) => write!(f, "principal issuer `{i}` has an empty subject"),
             Self::SubjectContainsSeparator(i) => write!(
@@ -199,6 +249,10 @@ impl fmt::Display for PrincipalParseError {
             Self::InvalidApiKeyId(s) => {
                 write!(f, "principal subject `{s}` is not a valid api key id")
             }
+            Self::InvalidOidcSubject { subject, reason } => write!(
+                f,
+                "principal subject `{subject}` is not a valid oidc subject: {reason}"
+            ),
         }
     }
 }
@@ -246,6 +300,25 @@ impl Principal {
         let subject = subject.into();
         issuer.validate(&subject)?;
         Ok(Self { issuer, subject })
+    }
+
+    /// The principal an OIDC provider adapter mints: `oidc:<provider>/<sub>`.
+    ///
+    /// `provider` is the adapter's configured name (`auth0`). `sub` is the
+    /// provider's subject exactly as its token carries it; any `:`, `%`,
+    /// quote, backslash or non-printable byte is percent-encoded, so
+    /// `auth0|64f1` stays `auth0|64f1` and a colon-bearing subject still
+    /// has one rendering that round-trips through `Display` and `FromStr`.
+    pub fn oidc(provider: &str, sub: &str) -> Result<Self, PrincipalParseError> {
+        let mut encoded = String::with_capacity(sub.len());
+        for b in sub.bytes() {
+            if b.is_ascii_graphic() && !matches!(b, b':' | b'%' | b'"' | b'\\') {
+                encoded.push(b as char);
+            } else {
+                encoded.push_str(&format!("%{b:02X}"));
+            }
+        }
+        Self::new(Issuer::Oidc, format!("{provider}/{encoded}"))
     }
 
     /// An idp-minted principal from a UUID.

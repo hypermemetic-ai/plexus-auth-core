@@ -11,7 +11,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::auth::AuthContext;
-use crate::oidc::config::OidcConfig;
+use crate::oidc::config::{AudienceClaim, OidcConfig};
 use crate::oidc::fetch::JwksFetcher;
 use crate::oidc::jwks;
 use crate::tenant::types::{TenantError, TenantId};
@@ -124,6 +124,11 @@ struct OidcClaims {
     /// Plexus extension; optional for validation.
     #[serde(default)]
     username: Option<String>,
+    /// Every other claim, kept for provider adapters (IDENTITY-13): Auth0
+    /// puts roles under a namespaced claim, and names under `nickname`,
+    /// `name` or `email`.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The OIDC discovery document fields the validator needs.
@@ -263,11 +268,28 @@ impl OidcValidator {
         // are accepted; any other issuer fails.
         let issuer_str = self.config.issuer().as_url().as_str();
         validation.set_issuer(&[issuer_str, issuer_str.trim_end_matches('/')]);
-        validation.set_audience(&[self.config.audience().as_str()]);
-        validation.set_required_spec_claims(&["sub", "exp", "iss", "aud"]);
+        match self.config.audience_claim() {
+            AudienceClaim::Aud => {
+                validation.set_audience(&[self.config.audience().as_str()]);
+                validation.set_required_spec_claims(&["sub", "exp", "iss", "aud"]);
+            }
+            AudienceClaim::ClientId => {
+                // IDENTITY-30: no `aud` to check; `client_id` is, below.
+                validation.validate_aud = false;
+                validation.set_required_spec_claims(&["sub", "exp", "iss"]);
+            }
+        }
 
         let data = decode::<OidcClaims>(token, &key, &validation).map_err(map_jwt_error)?;
         let claims = data.claims;
+
+        // ── client_id: the audience, where the provider names it there
+        //    (WorkOS); absent or another client's ⇒ reject. ─────────────
+        if self.config.audience_claim() == AudienceClaim::ClientId
+            && claims.extra.get("client_id").and_then(serde_json::Value::as_str) != Some(self.config.audience().as_str())
+        {
+            return Err(OidcError::WrongAudience);
+        }
 
         // ── iat: required by OidcClaims' non-optional field; must not be
         //    in the future (zero leeway, symmetric with exp). ───────────
@@ -308,6 +330,7 @@ impl OidcValidator {
             roles: claims.roles.unwrap_or_default(),
             username: claims.username,
             session_id,
+            extra: claims.extra,
         })
     }
 
@@ -438,6 +461,8 @@ pub struct VerifiedToken {
     roles: Vec<String>,
     username: Option<String>,
     session_id: String,
+    /// Claims beyond the ones read above, verified with them.
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl VerifiedToken {
@@ -461,6 +486,14 @@ impl VerifiedToken {
     /// The `username` extension claim, if present.
     pub fn username(&self) -> Option<&str> {
         self.username.as_deref()
+    }
+
+    /// Any other verified claim by name: `nickname`, `email`, or a
+    /// provider's namespaced claim such as `https://menger.example/roles`.
+    /// The claims read into fields above (`sub`, `iss`, `exp`, `iat`,
+    /// `org_id`, `sid`, `jti`, `roles`, `username`) are not repeated here.
+    pub fn claim(&self, name: &str) -> Option<&serde_json::Value> {
+        self.extra.get(name)
     }
 
     /// The session identifier (`sid`, else `jti`, else the token's

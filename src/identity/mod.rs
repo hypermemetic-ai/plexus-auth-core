@@ -62,6 +62,8 @@
 mod authenticator;
 mod linking;
 mod principal;
+#[cfg(feature = "adapters")]
+pub(crate) use principal::valid_provider_name;
 
 pub use authenticator::{
     ApiKeyAuthenticator, ApiKeyDigest, Authenticated, AuthenticatorChain, AuthnRejection,
