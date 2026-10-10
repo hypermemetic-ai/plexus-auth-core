@@ -64,6 +64,10 @@
 //!   one scope check. [`AuditSink`] is the framework's persistence trait;
 //!   [`TracingAuditSink`] is the default impl emitting `tracing::info!`
 //!   events under `target = "plexus::audit"`.
+//! - [`grants`] (AUTH-2) — [`Grant`] (`<activation>.<method>`, inherent),
+//!   [`ScopeRef`], [`GrantSet`], [`Membership`], [`Ceiling`], the service
+//!   traits [`Memberships`] / [`Roles`] / [`Resolve`], and the [`Gate`] whose
+//!   [`Gate::check`] answers a call with a [`Reach`] or a [`Refusal`].
 //! - [`ScopeRegistry`] — hub-level roles→scopes source of truth (R-0,
 //!   reviving AUTHZ-CORE-4 + CORE-6). [`Role`]s are named scope-sets with
 //!   transitive, build-time-cycle-rejected inheritance; [`Scope`] gains the
@@ -126,6 +130,9 @@ pub mod adapters;
 
 pub mod forward;
 
+/// AUTH-2: grants, roles, memberships, ceilings, and the gate.
+pub mod grants;
+
 pub use audit::{
     AuditDecision, AuditDenyReason, AuditRecord, AuditRecordKind, AuditSink, ForwardPolicyApplied,
     RoleName, ScopeCheck, SensitiveField, SessionId, TracingAuditSink, UserId,
@@ -152,6 +159,10 @@ pub use credential::{
 pub use forward::{
     Anonymous, CallSite, ForwardDerivation, ForwardPolicy, ForwardPolicyName, IdentityOnly,
     PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
+};
+pub use grants::{
+    Ceiling, CeilingError, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal, Resolve,
+    RoleOrGrant, RoleTable, RoleTableError, Roles, ScopeRef, ADMIN, CEILING_KEY,
 };
 pub use oidc::{
     Audience, AudienceError, FetchError, FetchedDocument, JwksFetcher, OidcConfig, OidcError,
