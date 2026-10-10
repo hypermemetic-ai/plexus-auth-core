@@ -52,6 +52,8 @@ pub enum OidcError {
     WrongIssuer,
     /// `aud` does not match the configured audience.
     WrongAudience,
+    /// `nbf` is in the future (zero leeway; IDENTITY-27).
+    NotYetValid,
     /// `iat` is in the future (zero leeway).
     IssuedInFuture {
         /// The token's `iat`.
@@ -83,6 +85,7 @@ impl fmt::Display for OidcError {
             }
             Self::InvalidSignature => f.write_str("token signature invalid"),
             Self::Expired => f.write_str("token expired (exp in the past, zero leeway)"),
+            Self::NotYetValid => f.write_str("token not yet valid (nbf in the future, zero leeway)"),
             Self::WrongIssuer => f.write_str("token iss does not match configured issuer"),
             Self::WrongAudience => f.write_str("token aud does not match configured audience"),
             Self::IssuedInFuture { iat, now } => {
@@ -138,11 +141,17 @@ struct DiscoveryDoc {
     jwks_uri: String,
 }
 
+/// How often an unknown `kid` may cause a JWKS refetch, for the whole
+/// validator (IDENTITY-27). A burst of tokens naming kids the IdP never
+/// published costs one fetch a minute, not one each.
+const KID_MISS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// JWKS cache state, guarded by a `std::sync::Mutex` that is **never
 /// held across an await** (lock → copy/update → drop; fetches happen
-/// unlocked). Concurrent kid-miss validations may therefore race into
-/// concurrent refreshes — harmless: the policy bound ("exactly one
-/// refresh") is per validation call, not global.
+/// unlocked). Refreshes themselves are single-flight (IDENTITY-27): they
+/// run under the validator's async `refresh_lock`, and a caller that
+/// waited on it while another refreshed uses that refresh instead of
+/// fetching again (`generation`).
 struct CacheState {
     /// Discovered `jwks_uri`. Cached for the validator's lifetime once
     /// resolved; refreshed only if a later refresh cycle needs it again.
@@ -158,6 +167,16 @@ struct CacheState {
     /// the `auth_provider_degraded` / `auth_provider_restored` event
     /// transitions.
     degraded: bool,
+    /// Counts refresh attempts (successful or not). A caller notes it
+    /// before waiting on `refresh_lock`; if it moved meanwhile, someone
+    /// else refreshed, and the caller uses that result.
+    generation: u64,
+    /// The last refresh attempt's failure, reported to callers that
+    /// waited on it when no cached keys exist.
+    last_error: Option<String>,
+    /// When an unknown `kid` last caused a refresh: at most one per
+    /// [`KID_MISS_REFRESH_INTERVAL`], validator-wide.
+    kid_miss_at: Option<Instant>,
 }
 
 /// Outcome of a refresh attempt.
@@ -186,6 +205,9 @@ pub struct OidcValidator {
     config: OidcConfig,
     fetcher: Arc<dyn JwksFetcher>,
     state: Mutex<CacheState>,
+    /// Held across a refresh's fetches, so concurrent refreshes coalesce
+    /// into one (IDENTITY-27).
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl OidcValidator {
@@ -206,8 +228,23 @@ impl OidcValidator {
                 fetched_at: None,
                 ttl: Duration::from_secs(0),
                 degraded: false,
+                generation: 0,
+                last_error: None,
+                kid_miss_at: None,
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Treat the cached keys as stale and forget the last kid-miss
+    /// refresh, so the next validation refetches. Costs one fetch and
+    /// weakens nothing; it exists so tests can step past the 60 s floors
+    /// without sleeping.
+    #[doc(hidden)]
+    pub fn expire_cache(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.fetched_at = None;
+        st.kid_miss_at = None;
     }
 
     /// The validator's configuration.
@@ -220,7 +257,7 @@ impl OidcValidator {
     /// Steps: header gate (`alg` == RS256, `kid` present) → cache
     /// freshness (refresh on cold/expired TTL; degrade to stale keys if
     /// the IdP is unreachable and a cache exists) → kid lookup (miss →
-    /// exactly one unconditional refresh, then reject) → RS256 signature
+    /// one refresh — at most one a minute per validator — then reject) → RS256 signature
     /// + `iss`/`aud`/`exp` with zero leeway → `iat` not in the future →
     /// `org_id` → [`TenantId`] → [`VerifiedUser`] minted.
     pub async fn validate_token(&self, token: &str) -> Result<VerifiedToken, OidcError> {
@@ -233,26 +270,28 @@ impl OidcValidator {
         let kid = header.kid.ok_or(OidcError::MissingKeyId)?;
 
         // ── Cache freshness ───────────────────────────────────────────
-        let needs_refresh = {
+        let (needs_refresh, generation) = {
             let st = self.state.lock().unwrap();
-            st.fetched_at.is_none_or(|at| at.elapsed() >= st.ttl)
+            (st.fetched_at.is_none_or(|at| at.elapsed() >= st.ttl), st.generation)
         };
         let mut refresh_attempted = false;
         if needs_refresh {
-            self.refresh().await?;
+            self.refresh(generation, false).await?;
             refresh_attempted = true;
         }
 
-        // ── Key selection (kid-miss → one refresh — AUTH-8) ───────────
+        // ── Key selection (kid-miss → one refresh — AUTH-8; at most one
+        //    a minute per validator, single-flight — IDENTITY-27) ───────
         let key = match self.lookup(&kid) {
             Some(k) => k,
             None => {
                 if !refresh_attempted {
-                    // The one unconditional refresh the policy grants a
-                    // kid-miss (key-rotation case: a new kid published
-                    // inside the TTL window). If this call already
-                    // refreshed above, that refresh *was* the one.
-                    self.refresh().await?;
+                    // The refresh the policy grants a kid-miss
+                    // (key-rotation case: a new kid published inside the
+                    // TTL window). If this call already refreshed above,
+                    // that refresh *was* the one.
+                    let generation = self.state.lock().unwrap().generation;
+                    self.refresh(generation, true).await?;
                 }
                 self.lookup(&kid).ok_or(OidcError::UnknownKeyId(kid.clone()))?
             }
@@ -262,6 +301,9 @@ impl OidcValidator {
         let mut validation = Validation::new(Algorithm::RS256);
         // No grace anywhere (AUTH-8): default leeway is 60 s — zero it.
         validation.leeway = 0;
+        // IDENTITY-27: `nbf`, when present, is honoured with the same
+        // zero leeway (jsonwebtoken leaves it unchecked by default).
+        validation.validate_nbf = true;
         // Trailing-slash tolerance: `Url` normalizes a root issuer to a
         // trailing slash while many IdPs mint `iss` without one (and
         // Auth0 mints *with* one). Both spellings of the *same* issuer
@@ -350,10 +392,38 @@ impl OidcValidator {
     ///   `exp` is still in the future, because `exp` is enforced with
     ///   zero grace regardless (AUTH-8).
     /// - Failure with no cache → error.
-    async fn refresh(&self) -> Result<RefreshOutcome, OidcError> {
-        match self.try_fetch_keys().await {
+    ///
+    /// Single-flight (IDENTITY-27): `seen` is the `generation` the caller
+    /// read before deciding to refresh. Once it holds `refresh_lock`, a
+    /// moved generation means another caller refreshed meanwhile — that
+    /// refresh is this one's. A `kid_miss` refresh additionally fetches at
+    /// most once per [`KID_MISS_REFRESH_INTERVAL`]; inside it, the cache
+    /// stands as it is.
+    async fn refresh(&self, seen: u64, kid_miss: bool) -> Result<RefreshOutcome, OidcError> {
+        let _flight = self.refresh_lock.lock().await;
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.generation != seen {
+                return Self::settled(&st);
+            }
+            if kid_miss {
+                if st.kid_miss_at.is_some_and(|at| at.elapsed() < KID_MISS_REFRESH_INTERVAL) {
+                    tracing::debug!(
+                        target: "plexus::auth",
+                        issuer = %self.config.issuer(),
+                        "unknown kid: JWKS refreshed for a kid-miss within the last minute; not refetching"
+                    );
+                    return Self::settled(&st);
+                }
+                st.kid_miss_at = Some(Instant::now());
+            }
+        }
+        let fetched = self.try_fetch_keys().await;
+        let mut st = self.state.lock().unwrap();
+        st.generation += 1;
+        match fetched {
             Ok((keys, ttl, jwks_uri)) => {
-                let mut st = self.state.lock().unwrap();
+                st.last_error = None;
                 if st.degraded {
                     tracing::info!(
                         target: "plexus::auth",
@@ -369,7 +439,7 @@ impl OidcValidator {
                 Ok(RefreshOutcome::Fresh)
             }
             Err(err) => {
-                let mut st = self.state.lock().unwrap();
+                st.last_error = Some(err.to_string());
                 if st.keys.is_empty() {
                     return Err(err);
                 }
@@ -386,6 +456,17 @@ impl OidcValidator {
                 Ok(RefreshOutcome::Degraded)
             }
         }
+    }
+
+    /// The outcome of a refresh another caller made (or that the kid-miss
+    /// interval skipped): the cache as it stands.
+    fn settled(st: &CacheState) -> Result<RefreshOutcome, OidcError> {
+        if st.keys.is_empty() {
+            if let Some(e) = &st.last_error {
+                return Err(OidcError::JwksUnavailable(e.clone()));
+            }
+        }
+        Ok(if st.degraded { RefreshOutcome::Degraded } else { RefreshOutcome::Fresh })
     }
 
     /// Fetch (and, if needed, discover) the JWKS. Pure fetch+parse; no
@@ -432,8 +513,27 @@ impl OidcValidator {
             )));
         }
 
-        Url::parse(&parsed.jwks_uri)
-            .map_err(|e| OidcError::Discovery(format!("invalid jwks_uri: {e}")))
+        let jwks_uri = Url::parse(&parsed.jwks_uri)
+            .map_err(|e| OidcError::Discovery(format!("invalid jwks_uri: {e}")))?;
+        trusted_jwks_uri(self.config.issuer().as_url(), &jwks_uri)?;
+        Ok(jwks_uri)
+    }
+}
+
+/// IDENTITY-27: the discovery document may not point the validator at an
+/// arbitrary host. `jwks_uri` is trusted when it is `https`, or when it is
+/// on the issuer's own origin (scheme, host and port) — which is what lets
+/// a loopback `http` issuer in a test publish its keys beside itself.
+fn trusted_jwks_uri(issuer: &Url, jwks_uri: &Url) -> Result<(), OidcError> {
+    let same_origin = jwks_uri.scheme() == issuer.scheme()
+        && jwks_uri.host_str() == issuer.host_str()
+        && jwks_uri.port_or_known_default() == issuer.port_or_known_default();
+    if jwks_uri.scheme() == "https" || same_origin {
+        Ok(())
+    } else {
+        Err(OidcError::Discovery(format!(
+            "jwks_uri {jwks_uri} is neither https nor on the issuer's origin"
+        )))
     }
 }
 
@@ -442,6 +542,7 @@ fn map_jwt_error(e: jsonwebtoken::errors::Error) -> OidcError {
     use jsonwebtoken::errors::ErrorKind;
     match e.kind() {
         ErrorKind::ExpiredSignature => OidcError::Expired,
+        ErrorKind::ImmatureSignature => OidcError::NotYetValid,
         ErrorKind::InvalidIssuer => OidcError::WrongIssuer,
         ErrorKind::InvalidAudience => OidcError::WrongAudience,
         ErrorKind::InvalidSignature => OidcError::InvalidSignature,
@@ -514,7 +615,9 @@ impl VerifiedToken {
     /// - `iss` — the verified issuer;
     /// - `username` — when the extension claim was present;
     /// - `auth_method: "oidc"` — parity with the API-key path's
-    ///   `auth_method` marker in the trak reference.
+    ///   `auth_method` marker in the trak reference;
+    /// - `expires_at` — the token's `exp`, seconds since the epoch
+    ///   (IDENTITY-27).
     pub fn into_auth_context(self) -> AuthContext {
         let mut metadata = serde_json::Map::new();
         if let Some(t) = self.user.tenant_id() {
@@ -535,6 +638,9 @@ impl VerifiedToken {
             "auth_method".into(),
             serde_json::Value::String("oidc".into()),
         );
+        // IDENTITY-27: the token's `exp`, so a service can stop honouring
+        // a connection its token no longer vouches for.
+        metadata.insert("expires_at".into(), serde_json::Value::from(self.user.expires_at()));
 
         AuthContext::new(
             self.user.user_id().to_string(),

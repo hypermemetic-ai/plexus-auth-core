@@ -78,6 +78,9 @@ pub enum AdapterError {
     Audience(String),
     /// A service URL a NIP-98 adapter cannot parse.
     ServiceUrl(String),
+    /// Two adapters in one chain speak for the same provider name
+    /// (IDENTITY-27): both would mint the same principals.
+    DuplicateProvider(String),
 }
 
 impl fmt::Display for AdapterError {
@@ -89,6 +92,9 @@ impl fmt::Display for AdapterError {
             Self::Issuer(i) => write!(f, "issuer `{i}` is not an https URL (or http on loopback)"),
             Self::Audience(a) => write!(f, "audience `{a}` is not valid"),
             Self::ServiceUrl(u) => write!(f, "service URL `{u}` does not parse"),
+            Self::DuplicateProvider(n) => {
+                write!(f, "two adapters are named `{n}`: each provider needs its own name")
+            }
         }
     }
 }
@@ -353,6 +359,13 @@ impl Authenticator for OidcAdapter {
 const WINDOW_PAST_SECS: u64 = 60;
 const WINDOW_FUTURE_SECS: u64 = 30;
 
+/// How long an identity a NIP-98 event proved is honoured (IDENTITY-27):
+/// twelve hours from verification, unless [`Nip98Adapter::with_lifetime`]
+/// says otherwise. The event itself is good for a minute, but a WebSocket
+/// it opened would otherwise stand for as long as the socket does; a
+/// working day bounds that, and a client signs a fresh event to reconnect.
+pub const NIP98_DEFAULT_LIFETIME_SECS: u64 = 12 * 60 * 60;
+
 /// A nostr key's adapter: verifies a NIP-98 event (kind 27235) that names
 /// this service, and makes the key a `nostr:<hex>` principal named by its
 /// npub.
@@ -362,11 +375,28 @@ const WINDOW_FUTURE_SECS: u64 = 30;
 /// lowercase). Each event works once, within its window. IDENTITY-19:
 /// [`Nip98Adapter::for_method`] takes another method, as a login endpoint
 /// that is POSTed to does.
+///
+/// IDENTITY-27:
+///
+/// - The identity carries `expires_at` (seconds since the epoch): the
+///   verification time plus the adapter's lifetime
+///   ([`NIP98_DEFAULT_LIFETIME_SECS`], or [`Nip98Adapter::with_lifetime`]).
+/// - A request body is bound by NIP-98's `payload` tag (the SHA-256 of the
+///   body, hex) only through [`Nip98Adapter::authenticate_request`], which
+///   is given the body. [`Authenticator::authenticate`] sees a
+///   [`Presentation`], which carries no body, so it does not check a
+///   `payload` tag: at a WebSocket upgrade (a GET) there is no body, and an
+///   endpoint whose body matters calls `authenticate_request`.
+/// - The replay ledger is this adapter's memory, so an event is refused a
+///   second time only by the same process. Two processes behind one URL
+///   would each accept it once; a deployment like that needs a shared
+///   ledger.
 pub struct Nip98Adapter {
     urls: Vec<url::Url>,
     method: String,
     roles: HashMap<String, Vec<String>>,
     seen: Mutex<HashMap<String, u64>>,
+    lifetime_secs: u64,
 }
 
 impl Nip98Adapter {
@@ -380,7 +410,30 @@ impl Nip98Adapter {
             .into_iter()
             .map(|u| url::Url::parse(u.as_ref()).map_err(|_| AdapterError::ServiceUrl(u.as_ref().to_string())))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { urls, method: "GET".into(), roles: HashMap::new(), seen: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            urls,
+            method: "GET".into(),
+            roles: HashMap::new(),
+            seen: Mutex::new(HashMap::new()),
+            lifetime_secs: NIP98_DEFAULT_LIFETIME_SECS,
+        })
+    }
+
+    /// Honour an identity this adapter proves for `secs` after it is
+    /// verified (its `expires_at`), instead of
+    /// [`NIP98_DEFAULT_LIFETIME_SECS`].
+    pub fn with_lifetime(mut self, secs: u64) -> Self {
+        self.lifetime_secs = secs;
+        self
+    }
+
+    /// Authenticate a request whose body is known: as
+    /// [`Authenticator::authenticate`], and the event's `payload` tag must
+    /// be the SHA-256 (hex) of `body`. A non-empty body requires the tag; an
+    /// empty body admits an event without one, and one whose tag hashes
+    /// the empty body.
+    pub async fn authenticate_request(&self, token: &str, body: &[u8]) -> Result<Authenticated, AuthnRejection> {
+        self.verify(&Presentation::Bearer { token: token.to_string() }, Some(body))
     }
 
     /// Events must name `method` (in any case) instead of GET.
@@ -422,7 +475,15 @@ impl Authenticator for Nip98Adapter {
     }
 
     async fn authenticate(&self, presentation: &Presentation) -> Result<Authenticated, AuthnRejection> {
+        self.verify(presentation, None)
+    }
+}
+
+impl Nip98Adapter {
+    /// The checks, with the request body when the caller has it.
+    fn verify(&self, presentation: &Presentation, body: Option<&[u8]>) -> Result<Authenticated, AuthnRejection> {
         use nostr::nips::nip19::ToBech32;
+        use sha2::Digest;
 
         let event = match presentation {
             Presentation::Bearer { token } => nip98_event(token),
@@ -449,6 +510,15 @@ impl Authenticator for Nip98Adapter {
             return Err(AuthnRejection::Expired);
         }
         event.verify().map_err(|_| AuthnRejection::SignatureInvalid)?;
+        if let Some(body) = body {
+            let want: String = sha2::Sha256::digest(body).iter().map(|b| format!("{b:02x}")).collect();
+            match tag("payload") {
+                Some(p) if p.eq_ignore_ascii_case(&want) => {}
+                Some(_) => return Err(AuthnRejection::Malformed("NIP-98: `payload` is not this body's hash".into())),
+                None if body.is_empty() => {}
+                None => return Err(AuthnRejection::Malformed("NIP-98: a body needs a `payload` tag".into())),
+            }
+        }
 
         let id = event.id.to_hex();
         {
@@ -474,6 +544,7 @@ impl Authenticator for Nip98Adapter {
         meta.insert("username".into(), Value::String(name));
         meta.insert("provider".into(), Value::String("nostr".into()));
         meta.insert("auth_method".into(), Value::String("nip98".into()));
+        meta.insert("expires_at".into(), Value::from(now.saturating_add(self.lifetime_secs)));
         let roles = self.roles.get(&hex).cloned().unwrap_or_default();
         Ok(Authenticated::new(principal, id, roles, Value::Object(meta)))
     }
@@ -489,6 +560,12 @@ impl Authenticator for Nip98Adapter {
 /// order (`access_token` for a token, `nostr` for a NIP-98 event; a browser
 /// can only send cookies); any other value is presented as a bearer token.
 /// Whichever adapter in the chain claims the credential decides.
+///
+/// [`Carriers::bearer_only`] reads no cookies (IDENTITY-27): a cookie is
+/// scoped to a host, not a port, so any page served from another port of
+/// the same host can plant one; only the `Authorization` value is then a
+/// credential, and a `Cookie` header the transport offers is refused
+/// without reaching the chain.
 pub struct Carriers {
     chain: AuthenticatorChain,
     cookies: Vec<String>,
@@ -500,8 +577,34 @@ impl Carriers {
         Self { chain, cookies: vec!["access_token".into(), "nostr".into()] }
     }
 
+    /// Only the `Authorization: Bearer` value (IDENTITY-27): no cookie is a
+    /// credential, and a value shaped like a `Cookie` header is refused
+    /// before any adapter sees it.
+    pub fn bearer_only(chain: AuthenticatorChain) -> Self {
+        Self { chain, cookies: Vec::new() }
+    }
+
+    /// As [`Carriers::cookie_and_bearer`], refusing a chain in which two
+    /// adapters share a provider name (IDENTITY-27).
+    pub fn try_cookie_and_bearer(chain: AuthenticatorChain) -> Result<Self, AdapterError> {
+        unique_names(&chain)?;
+        Ok(Self::cookie_and_bearer(chain))
+    }
+
+    /// As [`Carriers::bearer_only`], refusing a chain in which two adapters
+    /// share a provider name (IDENTITY-27).
+    pub fn try_bearer_only(chain: AuthenticatorChain) -> Result<Self, AdapterError> {
+        unique_names(&chain)?;
+        Ok(Self::bearer_only(chain))
+    }
+
     /// Authenticate one value the transport offers, with the reason kept.
     pub async fn authenticate(&self, value: &str) -> Result<Authenticated, AuthnRejection> {
+        if self.cookies.is_empty() && looks_like_cookie_header(value) {
+            return Err(AuthnRejection::Malformed(
+                "a Cookie header is not a credential here (bearer only)".into(),
+            ));
+        }
         let mut last = None;
         for name in &self.cookies {
             if let Some(token) = cookie(value, name) {
@@ -516,6 +619,25 @@ impl Carriers {
         }
         self.chain.authenticate(&Presentation::Bearer { token: value.trim().to_string() }).await
     }
+}
+
+/// Every name in `chain` once.
+fn unique_names(chain: &AuthenticatorChain) -> Result<(), AdapterError> {
+    let mut names = std::collections::HashSet::new();
+    for name in chain.names() {
+        if !names.insert(name) {
+            return Err(AdapterError::DuplicateProvider(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a value is a `Cookie` header (`name=value`, `;`-separated)
+/// rather than a bearer credential. A JWT holds no `=` or `;`; a base64
+/// NIP-98 event holds `=` only as trailing padding.
+fn looks_like_cookie_header(value: &str) -> bool {
+    let v = value.trim();
+    v.contains(';') || v.trim_end_matches('=').contains('=')
 }
 
 /// A named cookie's value in a `Cookie` header.

@@ -124,6 +124,10 @@ struct FixtureIdp {
     /// Issuer the discovery document claims (normally `ISSUER`; tests
     /// can lie to exercise the issuer-mismatch defense).
     discovery_issuer: Mutex<String>,
+    /// The `jwks_uri` discovery names (IDENTITY-27 tests point it away).
+    jwks_uri: Mutex<String>,
+    /// Delay on each JWKS response, so concurrent refreshes overlap.
+    delay_ms: AtomicUsize,
     offline: AtomicBool,
     discovery_fetches: AtomicUsize,
     jwks_fetches: AtomicUsize,
@@ -135,6 +139,8 @@ impl FixtureIdp {
             jwks: Mutex::new(jwks),
             cache_control: Mutex::new(None),
             discovery_issuer: Mutex::new(ISSUER.to_string()),
+            jwks_uri: Mutex::new(format!("{ISSUER}/jwks.json")),
+            delay_ms: AtomicUsize::new(0),
             offline: AtomicBool::new(false),
             discovery_fetches: AtomicUsize::new(0),
             jwks_fetches: AtomicUsize::new(0),
@@ -171,7 +177,7 @@ impl JwksFetcher for FixtureIdp {
                 Ok(FetchedDocument {
                     body: json!({
                         "issuer": issuer,
-                        "jwks_uri": format!("{ISSUER}/jwks.json"),
+                        "jwks_uri": self.jwks_uri.lock().unwrap().clone(),
                         "token_endpoint": format!("{ISSUER}/oauth/token"),
                         "id_token_signing_alg_values_supported": ["RS256"],
                     })
@@ -181,6 +187,10 @@ impl JwksFetcher for FixtureIdp {
             }
             "/jwks.json" => {
                 self.jwks_fetches.fetch_add(1, Ordering::SeqCst);
+                let delay = self.delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                }
                 let keys = self.jwks.lock().unwrap().join(",");
                 Ok(FetchedDocument {
                     body: format!(r#"{{"keys": [{keys}]}}"#),
@@ -469,16 +479,15 @@ async fn unknown_kid_rejected_after_exactly_one_refresh() {
 #[tokio::test]
 async fn offline_with_warm_cache_degrades_and_validates() {
     let idp = FixtureIdp::new(vec![JWK_1]);
-    // max-age=0 forces a refresh attempt on every validation, so going
-    // offline is observed immediately.
-    idp.set_cache_control(Some("max-age=0"));
     let v = validator(&idp);
 
     // Warm the cache online.
     v.validate_token(&mint_valid()).await.unwrap();
 
-    // IdP goes dark. Cached keys keep serving future-exp tokens.
+    // IdP goes dark, and the cache's TTL lapses (the test steps past it
+    // rather than waiting). Cached keys keep serving future-exp tokens.
     idp.set_offline(true);
+    v.expire_cache();
     v.validate_token(&mint_valid())
         .await
         .expect("warm cache must keep validating future-exp tokens while offline");
@@ -492,6 +501,7 @@ async fn offline_with_warm_cache_degrades_and_validates() {
 
     // Recovery: IdP returns; the next validation refreshes fresh keys.
     idp.set_offline(false);
+    v.expire_cache();
     let before = idp.jwks_fetch_count();
     v.validate_token(&mint_valid()).await.unwrap();
     assert!(idp.jwks_fetch_count() > before, "restored IdP must be refetched");
@@ -639,4 +649,150 @@ async fn session_id_prefers_sid_claim() {
     // segment) so the AuthContext reports authenticated.
     let verified2 = v.validate_token(&mint_valid()).await.unwrap();
     assert!(!verified2.session_id().is_empty());
+}
+
+// ─── IDENTITY-27: bounded refetching, trusted jwks_uri, nbf, expiry ─────
+
+fn token_with_kid(kid: &str) -> String {
+    mint(kid, KEY_1_PEM, claims())
+}
+
+#[tokio::test]
+async fn a_burst_of_unknown_kids_costs_one_fetch() {
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    let v = validator(&idp);
+    v.validate_token(&mint_valid()).await.unwrap();
+    assert_eq!(idp.jwks_fetch_count(), 1);
+
+    // One after another: the first unknown kid refreshes, the rest of the
+    // minute's do not.
+    for i in 0..20 {
+        let err = v.validate_token(&token_with_kid(&format!("nope-{i}"))).await.unwrap_err();
+        assert!(matches!(err, OidcError::UnknownKeyId(_)), "{err}");
+    }
+    assert_eq!(idp.jwks_fetch_count(), 2, "one kid-miss refresh a minute");
+
+    // A known kid is untouched by the limit.
+    v.validate_token(&mint_valid()).await.unwrap();
+    assert_eq!(idp.jwks_fetch_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_unknown_kids_share_one_fetch() {
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    let v = Arc::new(validator(&idp));
+    v.validate_token(&mint_valid()).await.unwrap();
+    idp.delay_ms.store(100, Ordering::SeqCst);
+    // The IdP rotates in a key; a burst of its tokens arrives at once.
+    idp.rotate_jwks(vec![JWK_1, JWK_2]);
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let v = Arc::clone(&v);
+            tokio::spawn(async move { v.validate_token(&mint(KID_2, KEY_2_PEM, claims())).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().expect("each waits on the one refresh and finds the new key");
+    }
+    assert_eq!(idp.jwks_fetch_count(), 2, "single-flight: one fetch for the burst");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_burst_shares_one_fetch() {
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    idp.delay_ms.store(100, Ordering::SeqCst);
+    let v = Arc::new(validator(&idp));
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let v = Arc::clone(&v);
+            tokio::spawn(async move { v.validate_token(&mint_valid()).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    assert_eq!(idp.jwks_fetch_count(), 1);
+    assert_eq!(idp.discovery_fetches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn max_age_zero_is_floored_at_a_minute() {
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    idp.set_cache_control(Some("max-age=0"));
+    let v = validator(&idp);
+    for _ in 0..5 {
+        v.validate_token(&mint_valid()).await.unwrap();
+    }
+    assert_eq!(idp.jwks_fetch_count(), 1, "max-age=0 must not refetch per validation");
+}
+
+#[tokio::test]
+async fn a_jwks_uri_on_another_http_host_is_refused() {
+    // An https issuer whose discovery points at plain http elsewhere.
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    *idp.jwks_uri.lock().unwrap() = "http://evil.test/jwks.json".into();
+    let err = validator(&idp).validate_token(&mint_valid()).await.unwrap_err();
+    assert!(matches!(err, OidcError::Discovery(ref m) if m.contains("jwks_uri")), "{err}");
+    assert_eq!(idp.jwks_fetch_count(), 0, "never fetched");
+
+    // http on the issuer's own origin is not this issuer's case (it is
+    // https), but https on another host is allowed (a CDN-hosted JWKS).
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    *idp.jwks_uri.lock().unwrap() = "https://keys.idp-cdn.test/jwks.json".into();
+    validator(&idp).validate_token(&mint_valid()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_loopback_http_issuer_may_publish_keys_beside_itself() {
+    const LOOP: &str = "http://127.0.0.1:4999";
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    *idp.discovery_issuer.lock().unwrap() = LOOP.into();
+    *idp.jwks_uri.lock().unwrap() = format!("{LOOP}/jwks.json");
+    let config = OidcConfig::new(
+        IssuerUrl::try_new(LOOP.parse().unwrap()).unwrap(),
+        Audience::try_new(AUDIENCE).unwrap(),
+    );
+    let v = OidcValidator::with_fetcher(config.clone(), Arc::clone(&idp) as Arc<dyn JwksFetcher>);
+    let mut c = claims();
+    c.insert("iss".into(), json!(LOOP));
+    v.validate_token(&mint(KID_1, KEY_1_PEM, c)).await.unwrap();
+
+    // Another port of the same loopback host is another origin.
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    *idp.discovery_issuer.lock().unwrap() = LOOP.into();
+    *idp.jwks_uri.lock().unwrap() = "http://127.0.0.1:5000/jwks.json".into();
+    let v = OidcValidator::with_fetcher(config, Arc::clone(&idp) as Arc<dyn JwksFetcher>);
+    let mut c = claims();
+    c.insert("iss".into(), json!(LOOP));
+    let err = v.validate_token(&mint(KID_1, KEY_1_PEM, c)).await.unwrap_err();
+    assert!(matches!(err, OidcError::Discovery(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_token_not_yet_valid_is_refused() {
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    let v = validator(&idp);
+    let mut c = claims();
+    // 10 s ahead: inside any default leeway, so this pins zero leeway too.
+    c.insert("nbf".into(), json!(now() + 10));
+    let err = v.validate_token(&mint(KID_1, KEY_1_PEM, c)).await.unwrap_err();
+    assert!(matches!(err, OidcError::NotYetValid), "{err}");
+
+    let mut c = claims();
+    c.insert("nbf".into(), json!(now() - 10));
+    v.validate_token(&mint(KID_1, KEY_1_PEM, c)).await.expect("nbf in the past is fine");
+}
+
+#[tokio::test]
+async fn the_auth_context_carries_the_token_s_expiry() {
+    let idp = FixtureIdp::new(vec![JWK_1]);
+    let mut c = claims();
+    let exp = now() + 1234;
+    c.insert("exp".into(), json!(exp));
+    let ctx = validator(&idp)
+        .validate_token(&mint(KID_1, KEY_1_PEM, c))
+        .await
+        .unwrap()
+        .into_auth_context();
+    assert_eq!(ctx.metadata["expires_at"].as_i64(), Some(exp));
 }

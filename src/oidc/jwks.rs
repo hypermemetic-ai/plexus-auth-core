@@ -14,9 +14,14 @@ use std::time::Duration;
 /// hour, regardless of what the server's `Cache-Control` says.
 const MAX_TTL: Duration = Duration::from_secs(3600);
 
+/// The TTL floor (IDENTITY-27): a JWKS is cached at least a minute, so a
+/// `max-age=0` cannot turn every validation into a fetch.
+const MIN_TTL: Duration = Duration::from_secs(60);
+
 /// Derive the JWKS cache TTL from a `Cache-Control` header.
 ///
-/// AUTH-8 policy: `TTL = min(Cache-Control max-age, 3600 s)`; a missing
+/// AUTH-8 policy: `TTL = min(Cache-Control max-age, 3600 s)`, floored at
+/// 60 s (IDENTITY-27); a missing
 /// or unparsable header defaults to the 3600 s ceiling. Only the
 /// `max-age` directive is consulted — `no-store`/`no-cache` collapse to
 /// `max-age=0` semantics only if expressed as such; the kid-miss refresh
@@ -33,7 +38,7 @@ pub(crate) fn ttl_from_cache_control(cache_control: Option<&str>) -> Duration {
             .or_else(|| directive.strip_prefix("MAX-AGE="))
         {
             if let Ok(secs) = v.trim().parse::<u64>() {
-                return Duration::from_secs(secs).min(MAX_TTL);
+                return Duration::from_secs(secs).clamp(MIN_TTL, MAX_TTL);
             }
         }
     }
@@ -154,10 +159,15 @@ mod tests {
             ttl_from_cache_control(Some("max-age=86400")),
             Duration::from_secs(3600)
         );
-        // Zero is honored — effectively "revalidate every request".
+        // Below the floor: 60 s (IDENTITY-27) — zero no longer means
+        // "refetch on every validation".
         assert_eq!(
             ttl_from_cache_control(Some("max-age=0")),
-            Duration::from_secs(0)
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            ttl_from_cache_control(Some("max-age=59")),
+            Duration::from_secs(60)
         );
     }
 
