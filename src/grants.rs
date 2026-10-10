@@ -499,12 +499,20 @@ pub enum Refusal {
         /// Where the caller does hold it (within its ceiling).
         held_on: Vec<ScopeRef>,
     },
+    /// AUTH-11: the caller signed in, but that sign-in no longer stands
+    /// (signed out, expired, revoked) — it proves no one.
+    Ended {
+        /// Why, in words for the caller ("you have signed out: sign in
+        /// again").
+        reason: String,
+    },
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unauthenticated => f.write_str("sign in first"),
+            Self::Ended { reason } => f.write_str(reason),
             Self::MissingGrant { grant, scope, .. } => write!(f, "needs {grant} on {scope}"),
         }
     }
@@ -613,10 +621,21 @@ impl Reach {
 // Gate
 // ---------------------------------------------------------------------------
 
+/// AUTH-11: whether a signed-in caller's sign-in still stands — the
+/// service's session table, asked by [`Gate::check`] on every call (and so
+/// on every [`Reach::allows`] / [`Reach::current`] a stream makes). A
+/// signed-out or revoked session proves no one, whatever its principal
+/// holds. Memory only, like the other service traits.
+pub trait Liveness: Send + Sync {
+    /// `Err`: why the sign-in no longer stands, in words for the caller.
+    fn alive(&self, caller: &AuthContext) -> Result<(), String>;
+}
+
 struct GateInner {
     memberships: Arc<dyn Memberships>,
     roles: Arc<dyn Roles>,
     resolve: Arc<dyn Resolve>,
+    liveness: Option<Arc<dyn Liveness>>,
 }
 
 /// The one rule in front of every call: the method's grant, held through a
@@ -637,7 +656,38 @@ impl fmt::Debug for Gate {
 impl Gate {
     /// A gate over a service's memberships, roles and resolver.
     pub fn new(memberships: Arc<dyn Memberships>, roles: Arc<dyn Roles>, resolve: Arc<dyn Resolve>) -> Self {
-        Self { inner: Arc::new(GateInner { memberships, roles, resolve }) }
+        Self { inner: Arc::new(GateInner { memberships, roles, resolve, liveness: None }) }
+    }
+
+    /// AUTH-11: this gate, asking `liveness` whether a caller's sign-in
+    /// still stands before every check. Without it the gate still refuses
+    /// a caller past its `expires_at` stamp ([`AuthContext::expired`]).
+    pub fn with_liveness(self, liveness: Arc<dyn Liveness>) -> Self {
+        let i = &self.inner;
+        Self {
+            inner: Arc::new(GateInner {
+                memberships: i.memberships.clone(),
+                roles: i.roles.clone(),
+                resolve: i.resolve.clone(),
+                liveness: Some(liveness),
+            }),
+        }
+    }
+
+    /// AUTH-11: whether `caller`'s sign-in still stands: not past its
+    /// `expires_at`, and live by the service's [`Liveness`]. An anonymous
+    /// context has no sign-in to end: `Ok`.
+    pub fn alive(&self, caller: &AuthContext) -> Result<(), String> {
+        if caller.principal().is_none() {
+            return Ok(());
+        }
+        if caller.expired() {
+            return Err("your sign-in has expired: sign in again".into());
+        }
+        match &self.inner.liveness {
+            Some(l) => l.alive(caller),
+            None => Ok(()),
+        }
     }
 
     /// Whether `role` lists `grant` ([`ADMIN`] lists every grant).
@@ -753,10 +803,17 @@ impl Gate {
     /// target's chain — or anywhere, for a call with no target — and every
     /// ceiling layer allows it the same way. The [`Reach`] is live (it asks
     /// this gate again on [`Reach::allows`] / [`Reach::current`]).
+    ///
+    /// AUTH-11: first, the caller's sign-in must still stand
+    /// ([`Gate::alive`]) — a signed-out session holds nothing, so a socket
+    /// that signed out cannot go on to call `auth.grant`.
     pub fn check(&self, caller: Option<&AuthContext>, grant: &Grant, target: Option<&str>) -> Result<Reach, Refusal> {
         let Some((principal, layers)) = Self::caller_of(caller) else {
             return Err(Refusal::Unauthenticated);
         };
+        if let Some(ctx) = caller {
+            self.alive(ctx).map_err(|reason| Refusal::Ended { reason })?;
+        }
         let held_on = self.held_on_for(&principal, &layers, grant);
         let (allowed, scope) = match target {
             None => (!held_on.is_empty(), ScopeRef::Everywhere),
@@ -1034,5 +1091,52 @@ mod tests {
         assert_eq!(c.0[1], (RoleOrGrant::Grant(g("tickets.get")), ScopeRef::Everywhere));
         assert_eq!(c.text(), vec!["editor@MENGER-12", "tickets.get@*"]);
         assert!(Ceiling::parse(["editor"]).is_err());
+    }
+
+    /// A session table with one switch: signed out or not.
+    #[derive(Default)]
+    struct Switch(std::sync::atomic::AtomicBool);
+    impl Liveness for Switch {
+        fn alive(&self, _: &AuthContext) -> Result<(), String> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("you have signed out: sign in again".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// AUTH-11: a signed-out session holds nothing — not even admin on `*`
+    /// — and a live reach taken before the sign-out ends with it.
+    #[test]
+    fn a_session_that_ended_holds_nothing() {
+        let m = Arc::new(Members::default());
+        m.grant(ADA, "admin", "*");
+        let out = Arc::new(Switch::default());
+        let gate = gate(&m).with_liveness(out.clone());
+        let reach = gate.check(Some(&who(ADA)), &g("auth.grant"), None).expect("admin before sign-out");
+        assert!(reach.allows("MENGER-1"));
+        out.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ended = Refusal::Ended { reason: "you have signed out: sign in again".into() };
+        assert_eq!(gate.check(Some(&who(ADA)), &g("auth.grant"), None).unwrap_err(), ended);
+        assert_eq!(gate.check(Some(&who(ADA)), &g("tickets.get"), Some("MENGER-1")).unwrap_err(), ended);
+        assert!(!reach.allows("MENGER-1"), "a stream's next event sees it");
+        assert!(reach.current().is_none());
+        assert!(gate.reach_of_public(Some(&who(ADA)), &g("auth.grant")).is_empty());
+        // Anonymous is not "ended": still plain Unauthenticated.
+        assert_eq!(gate.check(None, &g("auth.grant"), None).unwrap_err(), Refusal::Unauthenticated);
+    }
+
+    /// AUTH-11: past its `expires_at` stamp, a sign-in is over even with
+    /// no liveness hook.
+    #[test]
+    fn an_expired_sign_in_holds_nothing() {
+        let m = Arc::new(Members::default());
+        m.grant(ADA, "admin", "*");
+        let gate = gate(&m);
+        let past = AuthContext::for_principal(&ADA.parse().unwrap(), "s1", vec![], serde_json::json!({ "expires_at": 1 }));
+        assert!(matches!(gate.check(Some(&past), &g("auth.grant"), None), Err(Refusal::Ended { .. })));
+        let future = AuthContext::for_principal(&ADA.parse().unwrap(), "s1", vec![], serde_json::json!({ "expires_at": i64::MAX }));
+        assert!(gate.check(Some(&future), &g("auth.grant"), None).is_ok());
     }
 }
