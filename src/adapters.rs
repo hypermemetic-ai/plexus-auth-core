@@ -16,6 +16,7 @@
 //! | Auth0, Logto, any OIDC | [`OidcAdapter`], `auth0` or `generic` profile | `oidc:<provider>/<sub>` |
 //! | WorkOS (AuthKit, SSO) | [`OidcAdapter`], `workos` profile | `oidc:workos/<user id>` |
 //! | a nostr key | [`Nip98Adapter`] | `nostr:<hex>` |
+//! | an agent's Ed25519 key | [`KeyProofAdapter`] | `key:<hex>` |
 //!
 //! [`Carriers`] puts a chain of adapters at a WebSocket upgrade: a
 //! credential arrives in the `access_token` cookie, the `nostr` cookie, or
@@ -547,6 +548,301 @@ impl Nip98Adapter {
         meta.insert("expires_at".into(), Value::from(now.saturating_add(self.lifetime_secs)));
         let roles = self.roles.get(&hex).cloned().unwrap_or_default();
         Ok(Authenticated::new(principal, id, roles, Value::Object(meta)))
+    }
+}
+
+// ── Agent keys (IDENTITY-41) ───────────────────────────────────────────
+
+/// What a key proof starts with, as a bearer value.
+pub const KEY_PROOF_PREFIX: &str = "plexus-key.";
+
+/// The first line of the message a key proof signs.
+pub const KEY_PROOF_CONTEXT: &str = "plexus-key-login/v1";
+
+/// How long the identity a key proof opens stands, from its `ts`: a proof
+/// opens a connection, it is not a session.
+pub const KEY_PROOF_LIFETIME_SECS: i64 = 300;
+
+/// How old a key proof's `ts` may be, and how far ahead of this clock.
+const KEY_WINDOW_PAST_SECS: i64 = 60;
+const KEY_WINDOW_FUTURE_SECS: i64 = 30;
+
+/// A key proof's JSON, field for field as the wire says it, in its order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct KeyProofJson {
+    v: u64,
+    key: String,
+    aud: String,
+    agent: String,
+    nonce: String,
+    ts: i64,
+    sig: String,
+}
+
+/// The exact bytes a key proof signs: `plexus-key-login/v1\n<aud>\n<agent>\n<nonce>\n<ts>`,
+/// no trailing newline. `nonce` is the base64url (no padding) string the
+/// proof carries.
+pub fn key_proof_message(aud: &str, agent: &str, nonce: &str, ts: i64) -> String {
+    format!("{KEY_PROOF_CONTEXT}\n{aud}\n{agent}\n{nonce}\n{ts}")
+}
+
+/// Whether `agent` is an agent id: 1–64 of `[A-Za-z0-9._-]`.
+pub fn valid_agent_id(agent: &str) -> bool {
+    (1..=64).contains(&agent.len())
+        && agent.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The principal an Ed25519 public key is: `key:<64 lowercase hex>`.
+pub fn key_principal(public_key: &[u8; 32]) -> Principal {
+    Principal::new(Issuer::Key, hex(public_key)).expect("32 bytes are 64 lowercase hex")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Sign a key proof, as an agent does: the bearer value
+/// `plexus-key.<base64url(JSON)>` for the key whose 32-byte Ed25519 seed is
+/// `seed`, naming the socket `aud` it is for, the agent id, a 32-byte
+/// `nonce` and `ts` (unix seconds). The reference for every client: the
+/// JSON's fields are in the wire's order, `{"v":1,"key":…,"aud":…,
+/// "agent":…,"nonce":…,"ts":…,"sig":…}`.
+pub fn sign_key_proof(seed: &[u8; 32], aud: &str, agent: &str, nonce: &[u8; 32], ts: i64) -> String {
+    use ed25519_dalek::Signer;
+    let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let signing = ed25519_dalek::SigningKey::from_bytes(seed);
+    let nonce = b64.encode(nonce);
+    let sig = signing.sign(key_proof_message(aud, agent, &nonce, ts).as_bytes());
+    let proof = KeyProofJson {
+        v: 1,
+        key: hex(signing.verifying_key().as_bytes()),
+        aud: aud.to_string(),
+        agent: agent.to_string(),
+        nonce,
+        ts,
+        sig: b64.encode(sig.to_bytes()),
+    };
+    let json = serde_json::to_vec(&proof).expect("a key proof serializes");
+    format!("{KEY_PROOF_PREFIX}{}", b64.encode(json))
+}
+
+/// The proof a bearer value carries, decoded but not checked: `None` when it
+/// is not `plexus-key.<base64url-nopad JSON>` of the proof's shape.
+fn key_proof(value: &str) -> Option<KeyProofJson> {
+    let encoded = value.trim().strip_prefix(KEY_PROOF_PREFIX)?;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+/// The parts of a proof as a [`Presentation::SignedChallenge`] carries them:
+/// `scheme` `ed25519`, `key_id` the key's hex, `challenge` the signed
+/// message itself, `signature` base64url.
+fn signed_challenge(key_id: &str, challenge: &str, signature: &str) -> Option<KeyProofJson> {
+    let mut lines = challenge.split('\n');
+    if lines.next()? != KEY_PROOF_CONTEXT {
+        return None;
+    }
+    let (aud, agent, nonce, ts) = (lines.next()?, lines.next()?, lines.next()?, lines.next()?);
+    if lines.next().is_some() {
+        return None;
+    }
+    let ts: i64 = ts.parse().ok()?;
+    // The message must be exactly the canonical one for these parts.
+    if ts.to_string() != challenge.rsplit('\n').next()? {
+        return None;
+    }
+    Some(KeyProofJson {
+        v: 1,
+        key: key_id.to_string(),
+        aud: aud.to_string(),
+        agent: agent.to_string(),
+        nonce: nonce.to_string(),
+        ts,
+        sig: signature.to_string(),
+    })
+}
+
+/// A replay ledger's key: the public key and the nonce, as bytes.
+type KeyAndNonce = ([u8; 32], [u8; 32]);
+
+/// An agent's key's adapter (IDENTITY-40's wire): verifies a fresh Ed25519
+/// proof naming one of this server's socket URLs and an agent id, and makes
+/// the key a `key:<hex>` principal named by the agent.
+///
+/// A proof is the bearer value `plexus-key.<base64url-nopad of JSON>`,
+/// `{"v":1,"key":"<64 hex>","aud":"<ws url>","agent":"<id>","nonce":"<base64url, 32 bytes>","ts":<unix s>,"sig":"<base64url, 64 bytes>"}`,
+/// where `sig` is Ed25519 over [`key_proof_message`]. It is accepted when
+/// `v` is 1, `agent` is 1–64 of `[A-Za-z0-9._-]`, the nonce is 32 bytes,
+/// `ts` is within −60 s / +30 s of now, `aud` is one of the adapter's
+/// audiences (a trailing `/` aside), the signature verifies (strictly), and
+/// the `(key, nonce)` pair has not been accepted before. The identity:
+/// principal `key:<hex>`, metadata `agent` and `name` the agent id,
+/// `provider` and `auth_method` `key`, `expires_at` `ts + 300`.
+///
+/// It also takes a [`Presentation::SignedChallenge`] of scheme `ed25519`
+/// whose `challenge` is the signed message itself.
+///
+/// The replay ledger is this adapter's memory, pruned as proofs age out of
+/// the window: one process refuses a proof twice; two processes behind one
+/// URL would each accept it once.
+pub struct KeyProofAdapter {
+    audiences: Vec<String>,
+    seen: Mutex<HashMap<KeyAndNonce, i64>>,
+    clock: Box<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl fmt::Debug for KeyProofAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyProofAdapter").field("audiences", &self.audiences).finish()
+    }
+}
+
+fn system_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn audience_form(aud: &str) -> &str {
+    aud.trim_end_matches('/')
+}
+
+impl KeyProofAdapter {
+    /// An adapter accepting proofs whose `aud` is one of `audiences`: the
+    /// WebSocket URLs this server is dialed at (`ws://127.0.0.1:<port>`,
+    /// `ws://localhost:<port>`, any public one).
+    pub fn new<I, S>(audiences: I) -> Result<Self, AdapterError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut out = Vec::new();
+        for a in audiences {
+            let a = a.as_ref().trim();
+            match url::Url::parse(a) {
+                Ok(u) if matches!(u.scheme(), "ws" | "wss") => {}
+                _ => return Err(AdapterError::ServiceUrl(a.to_string())),
+            }
+            let a = audience_form(a).to_string();
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        Ok(Self { audiences: out, seen: Mutex::new(HashMap::new()), clock: Box::new(system_now) })
+    }
+
+    /// Read the time (unix seconds) from `clock` instead of the system's —
+    /// for tests and fixed vectors.
+    pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// The audiences it accepts.
+    pub fn audiences(&self) -> &[String] {
+        &self.audiences
+    }
+
+    fn proof_of(presentation: &Presentation) -> Option<KeyProofJson> {
+        match presentation {
+            Presentation::Bearer { token } => key_proof(token),
+            Presentation::SignedChallenge { scheme, key_id, challenge, signature } if scheme == "ed25519" => {
+                signed_challenge(key_id, challenge, signature)
+            }
+            _ => None,
+        }
+    }
+
+    fn verify(&self, proof: KeyProofJson) -> Result<Authenticated, AuthnRejection> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let bad = |why: &str| AuthnRejection::Malformed(format!("key proof: {why}"));
+
+        if proof.v != 1 {
+            return Err(bad("`v` is not 1"));
+        }
+        let principal = Principal::new(Issuer::Key, proof.key.clone()).map_err(|e| bad(&e.to_string()))?;
+        let key_bytes = unhex_32(&proof.key).ok_or_else(|| bad("`key` is not 32 bytes of hex"))?;
+        let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| bad("`key` is not an Ed25519 public key"))?;
+        if !valid_agent_id(&proof.agent) {
+            return Err(bad("`agent` must be 1-64 of A-Z, a-z, 0-9, `.`, `_` and `-`"));
+        }
+        let nonce: [u8; 32] = b64
+            .decode(&proof.nonce)
+            .ok()
+            .and_then(|n| n.try_into().ok())
+            .ok_or_else(|| bad("`nonce` is not 32 bytes of base64url"))?;
+        if !self.audiences.iter().any(|a| a == audience_form(&proof.aud)) {
+            return Err(bad("`aud` is not this server"));
+        }
+        let now = (self.clock)();
+        if proof.ts + KEY_WINDOW_PAST_SECS < now || proof.ts > now + KEY_WINDOW_FUTURE_SECS {
+            return Err(AuthnRejection::Expired);
+        }
+        let sig: [u8; 64] = b64
+            .decode(&proof.sig)
+            .ok()
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| bad("`sig` is not 64 bytes of base64url"))?;
+        let message = key_proof_message(&proof.aud, &proof.agent, &proof.nonce, proof.ts);
+        key.verify_strict(message.as_bytes(), &Signature::from_bytes(&sig))
+            .map_err(|_| AuthnRejection::SignatureInvalid)?;
+
+        {
+            let mut seen = self
+                .seen
+                .lock()
+                .map_err(|_| AuthnRejection::Backend("key proof replay ledger unavailable".into()))?;
+            // A proof past the window is refused anyway: forget it then.
+            seen.retain(|_, until| *until >= now);
+            if seen.insert((key_bytes, nonce), proof.ts + KEY_WINDOW_PAST_SECS).is_some() {
+                return Err(bad("this proof was already used"));
+            }
+        }
+
+        let mut meta = Map::new();
+        meta.insert("agent".into(), Value::String(proof.agent.clone()));
+        meta.insert("name".into(), Value::String(proof.agent));
+        meta.insert("provider".into(), Value::String("key".into()));
+        meta.insert("auth_method".into(), Value::String("key".into()));
+        meta.insert("expires_at".into(), Value::from(proof.ts + KEY_PROOF_LIFETIME_SECS));
+        Ok(Authenticated::new(principal, proof.nonce, Vec::new(), Value::Object(meta)))
+    }
+}
+
+#[async_trait]
+impl Authenticator for KeyProofAdapter {
+    fn name(&self) -> &str {
+        "key"
+    }
+
+    fn accepts(&self, presentation: &Presentation) -> bool {
+        match presentation {
+            Presentation::Bearer { token } => token.trim().starts_with(KEY_PROOF_PREFIX),
+            Presentation::SignedChallenge { scheme, .. } => scheme == "ed25519",
+            _ => false,
+        }
+    }
+
+    async fn authenticate(&self, presentation: &Presentation) -> Result<Authenticated, AuthnRejection> {
+        if !self.accepts(presentation) {
+            return Err(AuthnRejection::unsupported(self.name(), presentation));
+        }
+        let proof = Self::proof_of(presentation)
+            .ok_or_else(|| AuthnRejection::Malformed("key proof: not plexus-key.<base64url JSON> of a proof".into()))?;
+        self.verify(proof)
     }
 }
 

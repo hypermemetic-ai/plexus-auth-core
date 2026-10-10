@@ -56,7 +56,7 @@ oidc-reqwest = ["dep:reqwest"]
 # profiles (plexus-idp, Auth0, generic) with the reqwest fetcher, and the
 # nostr NIP-98 adapter. Off by default; a service that admits callers
 # through adapters turns it on.
-adapters = ["oidc-reqwest", "dep:nostr", "dep:base64", "dep:sha2"]
+adapters = ["oidc-reqwest", "dep:nostr", "dep:base64", "dep:sha2", "dep:ed25519-dalek"]
 
 [dependencies]
 # Serialization. Note: Deserialize is intentionally implemented in a way that
@@ -112,6 +112,8 @@ nostr = { version = "0.45", default-features = false, features = ["std"], option
 base64 = { version = "0.22", optional = true }
 # IDENTITY-27: a NIP-98 `payload` tag is the SHA-256 of the request body.
 sha2 = { version = "0.10", optional = true }
+# IDENTITY-41: an agent's Ed25519 key proof (`KeyProofAdapter`).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
 
 # IDENTITY-27: the validator's JWKS refresh is single-flight — concurrent
 # callers wait on one async lock instead of each fetching.
