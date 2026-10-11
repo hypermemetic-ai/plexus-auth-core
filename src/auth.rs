@@ -185,6 +185,18 @@ impl AuthContext {
         self.user_id != "anonymous" && !self.session_id.is_empty()
     }
 
+    /// AUTH-11: whether the sign-in this context carries has passed its
+    /// [`EXPIRES_AT_KEY`] stamp (unix seconds). A context with no stamp
+    /// never expires by this test; its validator may still end it
+    /// ([`SessionValidator::alive`]).
+    pub fn expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
+        self.metadata.get(EXPIRES_AT_KEY).and_then(Value::as_i64).is_some_and(|exp| exp <= now)
+    }
+
     /// Check if the user has a specific role.
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r == role)
@@ -396,6 +408,9 @@ impl AuthContext {
 ///     }
 /// }
 /// ```
+/// AUTH-11: the metadata key a session stamps its end under (unix seconds).
+pub const EXPIRES_AT_KEY: &str = "expires_at";
+
 #[async_trait]
 pub trait SessionValidator: Send + Sync + 'static {
     /// Validate a cookie header value and return an AuthContext if valid.
@@ -417,6 +432,21 @@ pub trait SessionValidator: Send + Sync + 'static {
     /// - For session-based auth: lookup session in DB/Redis
     /// - Return None for invalid/expired credentials (connection proceeds as anonymous)
     async fn validate(&self, cookie_value: &str) -> Option<AuthContext>;
+
+    /// AUTH-11: whether an identity this validator produced still stands —
+    /// asked while the connection it opened stays open, so a signed-out or
+    /// expired session's socket is closed rather than left to its next
+    /// call. `Err`: why not, in words for the caller.
+    ///
+    /// Default: not past its [`EXPIRES_AT_KEY`] stamp. A validator whose
+    /// sessions can end early (sign-out, revocation) must answer that here.
+    /// Memory only: it is asked often.
+    fn alive(&self, ctx: &AuthContext) -> Result<(), String> {
+        if ctx.expired() {
+            return Err("your sign-in has expired: sign in again".into());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
