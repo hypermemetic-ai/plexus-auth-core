@@ -308,6 +308,15 @@ impl Ceiling {
 /// from memory: no I/O on a call.
 pub trait Memberships: Send + Sync {
     fn held(&self, who: &Principal) -> Vec<Membership>;
+
+    /// What `who` holds of its own — without a membership the service
+    /// gives every signed-in principal (menger's `everyone` grant). It
+    /// decides whether `who` is still waiting for an admin (`auth.waiting`,
+    /// `auth.signup`); the gate reads [`Memberships::held`]. The default is
+    /// `held`: a service with no such grant has nothing to leave out.
+    fn own_held(&self, who: &Principal) -> Vec<Membership> {
+        self.held(who)
+    }
 }
 
 /// Role → grants (defaults declared in code, edits as data). Answered from
