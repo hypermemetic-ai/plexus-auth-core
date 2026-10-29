@@ -645,6 +645,95 @@ struct GateInner {
     roles: Arc<dyn Roles>,
     resolve: Arc<dyn Resolve>,
     liveness: Option<Arc<dyn Liveness>>,
+    generation: GrantsGeneration,
+}
+
+/// BIDIR-8: what moved the grants generation ([`Gate::moved`]) — every
+/// write that could change an answer the gate gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GrantsMove {
+    /// A membership added.
+    Grant,
+    /// A membership removed.
+    Revoke,
+    /// A role's grants edited.
+    RoleEdit,
+    /// A principal added to a team (it holds the team's grants).
+    TeamAdd,
+    /// A principal removed from a team.
+    TeamRemove,
+    /// A sign-in ended: signed out, or its session revoked.
+    SignOut,
+}
+
+/// BIDIR-8 (BIDIR-5's finding): the **grants generation** — a count every
+/// write that could change one of the gate's answers moves
+/// ([`GrantsMove`]). It is the gate's: whoever holds an answer across time
+/// (a duplex call's caller, a watch) records the generation it was decided
+/// at and asks the gate again only when it has moved — once per move, never
+/// per item. Cheap to clone (two `Arc`s, one count); a read is one atomic
+/// load; a move wakes every [`subscribe`](GrantsGeneration::subscribe)r.
+///
+/// A service shares one across its gates with [`Gate::with_generation`]
+/// (menger: the gate in front of its calls, the access layer's and the store's count are
+/// one).
+#[derive(Clone)]
+pub struct GrantsGeneration {
+    now: Arc<std::sync::atomic::AtomicU64>,
+    tx: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl fmt::Debug for GrantsGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("GrantsGeneration").field(&self.current()).finish()
+    }
+}
+
+impl Default for GrantsGeneration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GrantsGeneration {
+    /// A count at 0.
+    pub fn new() -> Self {
+        Self { now: Arc::new(std::sync::atomic::AtomicU64::new(0)), tx: Arc::new(tokio::sync::watch::channel(0).0) }
+    }
+
+    /// Something that could change an answer moved: +1, and every
+    /// subscriber woken. Answers the generation now.
+    pub fn bump(&self) -> u64 {
+        let n = self.now.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.tx.send_replace(n);
+        n
+    }
+
+    /// [`bump`](Self::bump), naming what moved (for the reader; the count
+    /// is one either way).
+    pub fn moved(&self, why: GrantsMove) -> u64 {
+        let _ = why;
+        self.bump()
+    }
+
+    /// The generation now (one atomic load).
+    pub fn current(&self) -> u64 {
+        self.now.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// At least `n` — a service that counted before it shared this handle
+    /// carries its count over. Never back: a smaller `n` changes nothing.
+    pub fn raise_to(&self, n: u64) {
+        let was = self.now.fetch_max(n, std::sync::atomic::Ordering::AcqRel);
+        if n > was {
+            self.tx.send_replace(self.current());
+        }
+    }
+
+    /// What wakes a holder when the generation moves.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.tx.subscribe()
+    }
 }
 
 /// The one rule in front of every call: the method's grant, held through a
@@ -665,7 +754,35 @@ impl fmt::Debug for Gate {
 impl Gate {
     /// A gate over a service's memberships, roles and resolver.
     pub fn new(memberships: Arc<dyn Memberships>, roles: Arc<dyn Roles>, resolve: Arc<dyn Resolve>) -> Self {
-        Self { inner: Arc::new(GateInner { memberships, roles, resolve, liveness: None }) }
+        Self { inner: Arc::new(GateInner { memberships, roles, resolve, liveness: None, generation: GrantsGeneration::new() }) }
+    }
+
+    /// BIDIR-8: this gate, counting its moves in `generation` — the
+    /// service's one ([`GrantsGeneration`]), shared by every gate it builds.
+    /// Without it a gate counts alone, from 0.
+    pub fn with_generation(self, generation: GrantsGeneration) -> Self {
+        let i = &self.inner;
+        Self {
+            inner: Arc::new(GateInner {
+                memberships: i.memberships.clone(),
+                roles: i.roles.clone(),
+                resolve: i.resolve.clone(),
+                liveness: i.liveness.clone(),
+                generation,
+            }),
+        }
+    }
+
+    /// BIDIR-8: the grants generation this gate's answers are decided at.
+    pub fn generation(&self) -> &GrantsGeneration {
+        &self.inner.generation
+    }
+
+    /// BIDIR-8: a write that could change this gate's answers happened
+    /// (the service wrote it — the gate keeps no memberships of its own):
+    /// the generation moves once. Answers the generation now.
+    pub fn moved(&self, why: GrantsMove) -> u64 {
+        self.inner.generation.moved(why)
     }
 
     /// AUTH-11: this gate, asking `liveness` whether a caller's sign-in
@@ -679,6 +796,7 @@ impl Gate {
                 roles: i.roles.clone(),
                 resolve: i.resolve.clone(),
                 liveness: Some(liveness),
+                generation: i.generation.clone(),
             }),
         }
     }
