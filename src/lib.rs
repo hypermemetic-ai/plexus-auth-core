@@ -130,11 +130,15 @@ pub mod adapters;
 
 pub mod forward;
 
+/// BIDIR-5 / BIDIR-8: the gate's rules for a duplex call — who sends, who answers,
+/// how much, and what crosses a hop.
+pub mod duplex;
+
 /// AUTH-2: grants, roles, memberships, ceilings, and the gate.
 pub mod grants;
 
 pub use audit::{
-    AuditDecision, AuditDenyReason, AuditRecord, AuditRecordKind, AuditSink, ForwardPolicyApplied,
+    AuditDecision, AuditQueue, AuditDenyReason, AuditRecord, AuditRecordKind, AuditSink, ForwardPolicyApplied,
     RoleName, ScopeCheck, SensitiveField, SessionId, TracingAuditSink, UserId,
 };
 pub use auth::{AuthContext, SessionValidator, PRINCIPAL_CLAIM};

@@ -56,7 +56,10 @@
 //! ticket).
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use crate::duplex::{CallRef, DuplexRefusalCode};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -320,7 +323,12 @@ impl std::fmt::Display for RoleName {
 /// Per AUTHLANG-S01-output §4 Tier-B resolution: the variant is **additive**
 /// with serde-default `ScopeCheck` so AUTHZ-side call sites that omit the
 /// `kind` field continue to deserialize as `ScopeCheck` records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// BIDIR-8 adds `DuplexRefused { call, reason }`: the gate refused a duplex
+/// call, one of its input frames or an answer to one of its questions —
+/// every typed refusal of [`DuplexRefusalCode`], one record each. (It
+/// carries data, so the enum is no longer `Copy`.)
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditRecordKind {
     /// A scope-check decision at default-deny dispatch (AUTHZ-CORE-5).
@@ -328,6 +336,14 @@ pub enum AuditRecordKind {
     ScopeCheck,
     /// A forwarding policy applied at a route-to-child edge (AUTHLANG-3).
     ForwardPolicyApplied,
+    /// BIDIR-8: the gate refused a duplex call (at open), a frame of its
+    /// input, or an answer to its question.
+    DuplexRefused {
+        /// Which call: its connection and subscription.
+        call: CallRef,
+        /// The refusal, as its `error_kind`.
+        reason: DuplexRefusalCode,
+    },
 }
 
 /// Marker type for the `ScopeCheck` audit-record kind.
@@ -600,6 +616,93 @@ pub trait AuditSink: Send + Sync + 'static {
     /// propagate the error to the caller. The framework awaits this future
     /// inside a panic guard and treats errors as non-fatal at this layer.
     async fn write(&self, record: AuditRecord);
+}
+
+// ---------------------------------------------------------------------------
+// BIDIR-8: the duplex refusal, and the queue that keeps the audit off the
+// frame path.
+// ---------------------------------------------------------------------------
+
+impl AuditRecord {
+    /// BIDIR-8: the record of one duplex refusal — who was refused
+    /// (`caller`'s principal and session, when it proved one), on which
+    /// call, of which method, and why. Built only when a refusal happens:
+    /// an admitted frame builds nothing.
+    pub fn duplex_refused(call: CallRef, reason: DuplexRefusalCode, caller: Option<&crate::auth::AuthContext>, method: &str) -> Self {
+        let principal = caller.and_then(|c| c.principal());
+        let deny = match reason {
+            DuplexRefusalCode::Unauthenticated => AuditDenyReason::Unauthenticated,
+            DuplexRefusalCode::Forbidden | DuplexRefusalCode::PersonRequired => AuditDenyReason::MissingScope,
+            DuplexRefusalCode::TooManyCalls | DuplexRefusalCode::PastCredit | DuplexRefusalCode::TooMuchInput => AuditDenyReason::RateLimited,
+            DuplexRefusalCode::NotThisCall | DuplexRefusalCode::InputClosed => AuditDenyReason::NotAccepted,
+        };
+        Self {
+            timestamp: Utc::now(),
+            kind: AuditRecordKind::DuplexRefused { call, reason },
+            originator: principal.as_ref().map(|p| UserId::new(p.to_string())),
+            session_id: caller.filter(|_| principal.is_some()).map(|c| SessionId::new(c.session_id.clone())),
+            invocation_chain: Vec::new(),
+            roles: Vec::new(),
+            method: MethodPath::try_new(method).unwrap_or_else(|_| MethodPath::try_new("unknown.method").expect("a valid path")),
+            scope_required: Vec::new(),
+            decision: AuditDecision::Deny { reason: deny },
+            latency_us: 0,
+            origin: None,
+            client_ip: None,
+            correlation_id: Uuid::new_v4(),
+            policy_name: None,
+            derivation: None,
+            caller_ns: None,
+        }
+    }
+}
+
+/// BIDIR-8: a bounded queue in front of an [`AuditSink`], so a refusal on a
+/// duplex call's frame path is audited without waiting on the sink. An
+/// [`offer`](AuditQueue::offer) never blocks: a full queue drops the record
+/// and counts it ([`dropped`](AuditQueue::dropped)). The drain is the
+/// future [`AuditQueue::new`] answers — the service spawns it; it writes
+/// each record to the sink in order and ends when every queue handle is gone.
+#[derive(Clone)]
+pub struct AuditQueue {
+    tx: tokio::sync::mpsc::Sender<AuditRecord>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for AuditQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditQueue").field("dropped", &self.dropped()).finish()
+    }
+}
+
+impl AuditQueue {
+    /// A queue of `capacity` records in front of `sink`, and its drain.
+    pub fn new(capacity: usize, sink: Arc<dyn AuditSink>) -> (Self, impl std::future::Future<Output = ()> + Send + 'static) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AuditRecord>(capacity.max(1));
+        let drain = async move {
+            while let Some(record) = rx.recv().await {
+                sink.write(record).await;
+            }
+        };
+        (Self { tx, dropped: Arc::new(AtomicU64::new(0)) }, drain)
+    }
+
+    /// Hand `record` to the sink, or — the queue full or its drain gone —
+    /// drop it and count it. Never waits. `true`: taken.
+    pub fn offer(&self, record: AuditRecord) -> bool {
+        match self.tx.try_send(record) {
+            Ok(()) => true,
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Records dropped because the queue was full (or its drain gone).
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 /// The default [`AuditSink`]: emit `tracing::info!` events under
