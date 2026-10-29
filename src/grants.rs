@@ -626,6 +626,21 @@ impl Reach {
         }
     }
 
+    /// FRAME-5: [`Reach::current`] with the gate's refusal kept — `Err`
+    /// says why the grant is held nowhere now: [`Refusal::Ended`] when the
+    /// sign-in no longer stands (signed out, expired, revoked session),
+    /// [`Refusal::MissingGrant`] when the grants moved away,
+    /// [`Refusal::Unauthenticated`] when the caller proves no one. A held
+    /// open call that must say *why* it ends (a watch's typed reason) asks
+    /// this; one that only needs to know whether asks `current`. Without a
+    /// gate: unchanged.
+    pub fn recheck(&self) -> Result<Reach, Refusal> {
+        match &self.live {
+            None => Ok(self.clone()),
+            Some(l) => l.gate.check(l.caller.as_ref(), &l.grant, None),
+        }
+    }
+
     /// Whether the reach covers a target whose chain is `chain` (as
     /// [`Resolve::chain`] gives it), by this snapshot — no new question to
     /// the gate. Prefer [`Reach::allows`] where the answer must be current.
