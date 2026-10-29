@@ -600,6 +600,14 @@ impl Reach {
         self.live.as_ref().map(|l| &l.grant)
     }
 
+    /// POLYGLOT-5: the grants generation of the gate this reach came from
+    /// (BIDIR-8) — a call held open elsewhere (a child service's stream)
+    /// asks [`Reach::current`] again only when it moved. `None` without a
+    /// gate.
+    pub fn generation(&self) -> Option<&GrantsGeneration> {
+        self.live.as_ref().map(|l| l.gate.generation())
+    }
+
     /// Whether the call may act on `target` — asked of the gate as it
     /// stands now. Without a gate: always.
     pub fn allows(&self, target: &str) -> bool {
