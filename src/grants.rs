@@ -226,7 +226,7 @@ pub struct Membership {
 /// spelled `editor@MENGER-12`, `tickets.get@*`. A check passes a ceiling
 /// when some entry's scope is in the target's chain and the entry allows the
 /// grant (the grant itself, or a role listing it).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Ceiling(pub Vec<(RoleOrGrant, ScopeRef)>);
 
 /// Why a ceiling could not be read.
@@ -298,6 +298,25 @@ impl Ceiling {
             })
             .collect()
     }
+}
+
+/// PERF-15: everything [`Gate::held_on`] reads of one signed-in caller,
+/// besides the grants generation — what its principal holds (each
+/// membership's role and scope, as a set) and its session's ceiling layers.
+/// Two callers with equal fingerprints hold the same grants on the same
+/// scopes, whoever they are: at one generation the gate answers them alike.
+/// So a service keeps what a caller may see (its view, AUTH-4) by it —
+/// one entry shared by every caller holding the same, dropped when the
+/// generation moves. Compared whole, never by a digest: two fingerprints are
+/// one key only when they are equal. [`Gate::fingerprint`] takes one,
+/// [`Gate::held_on_by`] answers from it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Fingerprint {
+    /// (role, scope) of each membership, sorted, each once.
+    held: Vec<(RoleName, ScopeRef)>,
+    /// The session's ceiling, as [`Ceiling::layers_of`] reads it (an
+    /// unreadable one is one empty layer, as the gate reads it).
+    layers: Vec<Ceiling>,
 }
 
 // ---------------------------------------------------------------------------
@@ -919,14 +938,20 @@ impl Gate {
     }
 
     fn held_on_for(&self, principal: &Principal, layers: &[Ceiling], grant: &Grant) -> Vec<ScopeRef> {
-        let mut acc = Self::normal(
-            self.inner
-                .memberships
-                .held(principal)
-                .into_iter()
-                .filter(|m| self.lists(&m.role, grant))
-                .map(|m| m.scope),
-        );
+        let held = self.inner.memberships.held(principal);
+        self.held_on_in(held.iter().map(|m| (&m.role, &m.scope)), layers, grant)
+    }
+
+    /// Where `held` (role, scope pairs) holds `grant` within `layers`: what
+    /// [`Gate::held_on`] answers from the memberships and
+    /// [`Gate::held_on_by`] from a [`Fingerprint`] — one rule.
+    fn held_on_in<'a>(
+        &self,
+        held: impl Iterator<Item = (&'a RoleName, &'a ScopeRef)>,
+        layers: &[Ceiling],
+        grant: &Grant,
+    ) -> Vec<ScopeRef> {
+        let mut acc = Self::normal(held.filter(|(role, _)| self.lists(role, grant)).map(|(_, scope)| scope.clone()));
         for layer in layers {
             if acc.is_empty() {
                 break;
@@ -947,6 +972,27 @@ impl Gate {
             Some((p, layers)) => self.held_on_for(&p, &layers, grant),
             None => Vec::new(),
         }
+    }
+
+    /// PERF-15: what this gate's answers about `caller` read, besides the
+    /// grants generation — its principal's memberships and its session's
+    /// ceiling ([`Fingerprint`]); `None` when it is anonymous. The
+    /// memberships are read now, from memory.
+    pub fn fingerprint(&self, caller: &AuthContext) -> Option<Fingerprint> {
+        let (principal, layers) = Self::caller_of(Some(caller))?;
+        let mut held: Vec<(RoleName, ScopeRef)> =
+            self.inner.memberships.held(&principal).into_iter().map(|m| (m.role, m.scope)).collect();
+        held.sort();
+        held.dedup();
+        Some(Fingerprint { held, layers })
+    }
+
+    /// PERF-15: [`Gate::held_on`] for whoever has `who` — read from the
+    /// fingerprint instead of the memberships, by the same rule, so a view
+    /// built from it is exactly the one built from any caller it was taken
+    /// of.
+    pub fn held_on_by(&self, who: &Fingerprint, grant: &Grant) -> Vec<ScopeRef> {
+        self.held_on_in(who.held.iter().map(|(r, s)| (r, s)), &who.layers, grant)
     }
 
     /// Allowed when the grant is listed by a role held on a scope in the
@@ -1288,5 +1334,36 @@ mod tests {
         assert!(matches!(gate.check(Some(&past), &g("auth.grant"), None), Err(Refusal::Ended { .. })));
         let future = AuthContext::for_principal(&ADA.parse().unwrap(), "s1", vec![], serde_json::json!({ "expires_at": i64::MAX }));
         assert!(gate.check(Some(&future), &g("auth.grant"), None).is_ok());
+    }
+
+    /// PERF-15: a fingerprint is what the gate's answers read of a caller —
+    /// equal for two principals holding the same, different when a
+    /// membership or the ceiling differs, `None` when anonymous — and
+    /// `held_on_by` answers from it exactly what `held_on` answers.
+    #[test]
+    fn a_fingerprint_is_what_the_answers_read() {
+        let m = Arc::new(Members::default());
+        m.grant(ADA, "viewer", "IDENTITY");
+        m.grant(ADA, "editor", "MENGER");
+        m.grant(BOB, "editor", "MENGER");
+        m.grant(BOB, "viewer", "IDENTITY");
+        m.grant(BOB, "editor", "MENGER");
+        let gate = gate(&m);
+        let (ada, bob) = (gate.fingerprint(&who(ADA)).unwrap(), gate.fingerprint(&who(BOB)).unwrap());
+        assert_eq!(ada, bob, "the same holdings, in another order and once more: one fingerprint");
+        assert_eq!(gate.fingerprint(&AuthContext::anonymous()), None);
+        let narrow = with_ceiling(ADA, serde_json::json!(["editor@MENGER-12"]));
+        let narrowed = gate.fingerprint(&narrow).unwrap();
+        assert_ne!(narrowed, ada, "a ceiling: another fingerprint");
+        let unreadable = gate.fingerprint(&with_ceiling(ADA, serde_json::json!("editor@*"))).unwrap();
+        assert_ne!(unreadable, ada, "an unreadable ceiling allows nothing: not the unbounded caller's");
+        for (ctx, fp) in [(&who(ADA), &ada), (&narrow, &narrowed), (&with_ceiling(ADA, serde_json::json!("editor@*")), &unreadable)] {
+            for grant in ["tickets.get", "tickets.set_status", "tickets.delete", "members.grant"] {
+                assert_eq!(gate.held_on_by(fp, &g(grant)), gate.held_on(ctx, &g(grant)), "{grant}");
+            }
+        }
+        assert_eq!(gate.held_on_by(&narrowed, &g("tickets.get")), vec![ScopeRef::named("MENGER-12")]);
+        m.revoke_all();
+        assert_ne!(gate.fingerprint(&who(ADA)).unwrap(), ada, "a revoke: another fingerprint");
     }
 }
