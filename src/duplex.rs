@@ -95,23 +95,40 @@ pub fn is_person(ctx: &AuthContext) -> bool {
     ctx.principal().is_some_and(|p| matches!(p.issuer(), Issuer::Idp | Issuer::Oidc))
 }
 
-/// How much one call may take in (BIDIR-1: "every item that flows has a
-/// limit"). Beside the transport's per-connection call count, which counts a
-/// duplex call as one call.
+/// The credit a method grants unless it says otherwise
+/// (`#[method(input_window = N)]`, BIDIR-6).
+pub const DEFAULT_INPUT_WINDOW: u64 = 64;
+
+/// The bytes one call may hold buffered unless it says otherwise
+/// (`#[method(input_max_buffered = N)]`, BIDIR-6).
+pub const DEFAULT_MAX_BUFFERED: u64 = 64 * 1024 * 1024;
+
+/// What one call may take in (BIDIR-1: "every item that flows has a limit").
+/// Beside the transport's per-connection call count, which counts a duplex
+/// call as one call.
+///
+/// BIDIR-6, the owner's decision: nothing limits what has *passed through* a
+/// call unless its method opts in (64 MiB is 56 minutes of 16 kHz PCM). What a
+/// call costs is what it holds, so what is bounded is what it holds: `credit`
+/// items, `max_buffered` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallCeiling {
     /// Credit granted with the call's answer: items the caller may send
-    /// before the callee grants more.
+    /// before the callee grants more, and so the items it can hold. The
+    /// callee's window, not a policy: it moves as the handler consumes.
     pub credit: u64,
-    /// Input items over the call's life.
+    /// Input items over the call's life. `u64::MAX` (the default): no limit.
     pub max_items: u64,
-    /// Input bytes over the call's life (each item as its JSON).
+    /// Input bytes over the call's life (each item as its JSON). `u64::MAX`
+    /// (the default): no limit.
     pub max_bytes: u64,
+    /// Input bytes held at once: received and not yet consumed.
+    pub max_buffered: u64,
 }
 
 impl Default for CallCeiling {
     fn default() -> Self {
-        Self { credit: 64, max_items: 1_000_000, max_bytes: 64 * 1024 * 1024 }
+        Self { credit: DEFAULT_INPUT_WINDOW, max_items: u64::MAX, max_bytes: u64::MAX, max_buffered: DEFAULT_MAX_BUFFERED }
     }
 }
 
@@ -141,12 +158,19 @@ pub enum DuplexRefusalCode {
     NotThisCall,
     /// An input item past the credit granted (`past_credit {seq, credit}`).
     PastCredit,
-    /// Past the call's ceiling of items or bytes (`too_much_input {limit, max}`).
+    /// Past the ceiling a method opted into, or the cap on what one call
+    /// holds buffered (`too_much_input {limit, max}`).
     TooMuchInput,
     /// A question that needs a person's answer, answered by an agent.
     PersonRequired,
     /// A frame or an answer after the input half closed.
     InputClosed,
+    /// A frame out of sequence on a socket, which delivers in order: a broken
+    /// client (`out_of_sequence {seq, expected}`).
+    OutOfSequence,
+    /// An input item that does not decode as the method's type
+    /// (`invalid_input {seq}`).
+    InvalidInput,
 }
 
 impl DuplexRefusalCode {
@@ -161,6 +185,8 @@ impl DuplexRefusalCode {
             Self::TooMuchInput => "too_much_input",
             Self::PersonRequired => "person_required",
             Self::InputClosed => "input_closed",
+            Self::OutOfSequence => "out_of_sequence",
+            Self::InvalidInput => "invalid_input",
         }
     }
 }
@@ -218,6 +244,15 @@ pub fn hop_identity(hop: &AuthContext, caller: &AuthContext, verdict: &[ScopeRef
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BIDIR-6: nothing ends a call for what has passed through it unless
+    /// its method opted in; what it holds is what is bounded.
+    #[test]
+    fn a_call_has_no_lifetime_ceiling_by_default() {
+        let c = CallCeiling::default();
+        assert_eq!((c.max_items, c.max_bytes), (u64::MAX, u64::MAX));
+        assert_eq!((c.credit, c.max_buffered), (DEFAULT_INPUT_WINDOW, DEFAULT_MAX_BUFFERED));
+    }
 
     #[test]
     fn answerer_reads_its_declaration() {
