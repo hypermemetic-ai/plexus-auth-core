@@ -110,7 +110,9 @@ pub const DEFAULT_MAX_BUFFERED: u64 = 64 * 1024 * 1024;
 /// BIDIR-6, the owner's decision: nothing limits what has *passed through* a
 /// call unless its method opts in (64 MiB is 56 minutes of 16 kHz PCM). What a
 /// call costs is what it holds, so what is bounded is what it holds: `credit`
-/// items, `max_buffered` bytes.
+/// items, and past `max_buffered` bytes no more credit until the handler
+/// drains below it. An obedient client is slowed, never ended (owner,
+/// 2026-11-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallCeiling {
     /// Credit granted with the call's answer: items the caller may send
@@ -122,7 +124,9 @@ pub struct CallCeiling {
     /// Input bytes over the call's life (each item as its JSON). `u64::MAX`
     /// (the default): no limit.
     pub max_bytes: u64,
-    /// Input bytes held at once: received and not yet consumed.
+    /// Input bytes held at once (received and not yet consumed) past which
+    /// the callee grants no credit until it drains below them. Not a refusal:
+    /// a client within its credit may still land up to a window's items.
     pub max_buffered: u64,
 }
 
@@ -158,8 +162,8 @@ pub enum DuplexRefusalCode {
     NotThisCall,
     /// An input item past the credit granted (`past_credit {seq, credit}`).
     PastCredit,
-    /// Past the ceiling a method opted into, or the cap on what one call
-    /// holds buffered (`too_much_input {limit, max}`).
+    /// Past the ceiling a method opted into (`too_much_input {limit, max}`,
+    /// `limit` `items` or `bytes`).
     TooMuchInput,
     /// A question that needs a person's answer, answered by an agent.
     PersonRequired,
