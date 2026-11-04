@@ -1,12 +1,12 @@
 [package]
 name = "plexus-auth-core"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Sealed-type primitives for the Plexus auth framework: AuthContext, VerifiedUser, Principal."
 license = "MIT"
 repository = "https://github.com/hypermemetic-ai/plexus-auth-core"
 # DIST-2: the published crate is the library and its licence.
-include = ["src/**", "LICENSE", "Cargo.toml"]
+include = ["src/**", "LICENSE", "CHANGELOG.md", "Cargo.toml"]
 
 # Why this is its own crate:
 #

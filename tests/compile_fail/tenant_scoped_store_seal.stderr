@@ -9,7 +9,14 @@ help: the trait `storage::seal::SealedStore` is not implemented for `MyStore`
    |
 12 | struct MyStore;
    | ^^^^^^^^^^^^^^
-   = help: the trait `storage::seal::SealedStore` is implemented for `InMemoryKvStore`
+help: the trait `storage::seal::SealedStore` is implemented for `InMemoryKvStore`
+  --> src/tenant/storage.rs
+   |
+   |         impl $crate::tenant::storage::seal::SealedStore for $t {}
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   |     seal_store_impl!(InMemoryKvStore);
+   |     --------------------------------- in this macro invocation
 note: required by a bound in `TenantScopedStore`
   --> src/tenant/storage.rs
    |
@@ -18,3 +25,4 @@ note: required by a bound in `TenantScopedStore`
    = note: `TenantScopedStore` is a "sealed trait", because to implement it you also need to implement `plexus_auth_core::tenant::storage::seal::SealedStore`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
    = help: the following type implements the trait:
              plexus_auth_core::tenant::storage::reference::InMemoryKvStore
+   = note: this error originates in the macro `seal_store_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
