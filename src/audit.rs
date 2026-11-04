@@ -634,7 +634,7 @@ impl AuditRecord {
             DuplexRefusalCode::Unauthenticated => AuditDenyReason::Unauthenticated,
             DuplexRefusalCode::Forbidden | DuplexRefusalCode::PersonRequired => AuditDenyReason::MissingScope,
             DuplexRefusalCode::TooManyCalls | DuplexRefusalCode::PastCredit | DuplexRefusalCode::TooMuchInput => AuditDenyReason::RateLimited,
-            DuplexRefusalCode::NotThisCall | DuplexRefusalCode::InputClosed => AuditDenyReason::NotAccepted,
+            DuplexRefusalCode::NotThisCall | DuplexRefusalCode::InputClosed | DuplexRefusalCode::OutOfSequence | DuplexRefusalCode::InvalidInput => AuditDenyReason::NotAccepted,
         };
         Self {
             timestamp: Utc::now(),
