@@ -321,6 +321,16 @@ impl AuthContext {
             if let Value::Object(ref mut map) = metadata {
                 map.remove(PRINCIPAL_CLAIM);
             }
+        } else if !derivation.keep_metadata {
+            // RETURNS-47: keeping the verified user keeps its whole identity.
+            // The principal stamp is identity, not metadata: without it a
+            // `key:` or `nostr:` caller (no idp UUID in `user_id`) is named by
+            // no one in the callee.
+            if let Some(stamp) = caller_ctx.metadata.get(PRINCIPAL_CLAIM) {
+                let mut map = serde_json::Map::new();
+                map.insert(PRINCIPAL_CLAIM.to_string(), stamp.clone());
+                metadata = Value::Object(map);
+            }
         }
         AuthContext {
             user_id,
