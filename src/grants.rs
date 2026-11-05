@@ -565,9 +565,6 @@ impl std::error::Error for Refusal {}
 pub struct Reach {
     held_on: Vec<ScopeRef>,
     live: Option<Live>,
-    /// RETURNS-47: the grant a hop's ceiling names
-    /// ([`Reach::from_hop_ceiling`]), when no gate of this process decided.
-    ceiling: Option<Grant>,
 }
 
 #[derive(Clone)]
@@ -598,26 +595,14 @@ impl Reach {
     /// Everything — what a method receives on a hub without a gate (login
     /// off), as today.
     pub fn everywhere() -> Self {
-        Self { held_on: vec![ScopeRef::Everywhere], live: None, ceiling: None }
+        Self { held_on: vec![ScopeRef::Everywhere], live: None }
     }
 
     /// RETURNS-47: nothing — the reach of a call made for no one (a child
-    /// under the `anonymous` forward policy). Covers and allows nothing.
+    /// under the `anonymous` forward policy, or one whose caller cannot be
+    /// read). Covers and allows nothing, and names no grant.
     pub fn nowhere() -> Self {
-        Self { held_on: Vec::new(), live: None, ceiling: None }
-    }
-
-    /// RETURNS-47: a child's reach for a call that came through the seam
-    /// (plexus-wire spec/12): the near side's verdict as a ceiling — `grant`
-    /// (the hop's `limit.grant`) held on `held_on` (its `limit.held_on`).
-    /// For the child seam only, which builds it from a hop it took from a
-    /// trusted sender; it is no gate's answer, and nothing else should make
-    /// a reach from a list of scopes. It names the grant and
-    /// [`covers`](Reach::covers) exactly the scopes held; with no gate
-    /// behind it, it [`allows`](Reach::allows) a target by name only when
-    /// held on `*`, and [`current`](Reach::current) answers it unchanged.
-    pub fn from_hop_ceiling(grant: Grant, held_on: Vec<ScopeRef>) -> Self {
-        Self { held_on, live: None, ceiling: Some(grant) }
+        Self { held_on: Vec::new(), live: None }
     }
 
     /// Whether the grant is held on `*`.
@@ -636,10 +621,9 @@ impl Reach {
         &self.held_on
     }
 
-    /// The grant this reach is for; `None` on a service without a gate. A
-    /// hop's ceiling names its grant.
+    /// The grant this reach is for; `None` on a service without a gate.
     pub fn grant(&self) -> Option<&Grant> {
-        self.live.as_ref().map(|l| &l.grant).or(self.ceiling.as_ref())
+        self.live.as_ref().map(|l| &l.grant)
     }
 
     /// POLYGLOT-5: the grants generation of the gate this reach came from
@@ -1058,7 +1042,6 @@ impl Gate {
             Ok(Reach {
                 held_on,
                 live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone() }),
-                ceiling: None,
             })
         } else {
             Err(Refusal::MissingGrant { grant: grant.clone(), scope, roles: self.roles_listing(grant), held_on })
@@ -1072,7 +1055,6 @@ impl Gate {
         self.check(caller, grant, None).unwrap_or_else(|_| Reach {
             held_on: Vec::new(),
             live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone() }),
-            ceiling: None,
         })
     }
 }

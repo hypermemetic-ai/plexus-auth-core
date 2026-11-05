@@ -12,15 +12,11 @@ RETURNS-47: what a child needs to receive auth (owner, 2026-11-04).
 
 ### Added
 
-- `Reach::from_hop_ceiling(grant, held_on)`: a child's reach for a call that
-  came through the child seam (plexus-wire spec/12) — the near side's verdict
-  as a ceiling. For the seam only: it is no gate's answer, and nothing else
-  should make a reach from a list of scopes. It names `grant`
-  (`Reach::grant`), covers exactly `held_on`, allows a target by name only
-  when held on `*` (no gate behind it to resolve one), and `current` answers
-  it unchanged.
 - `Reach::nowhere()`: the reach of a call made for no one (a child under the
-  `anonymous` forward policy): covers and allows nothing.
+  `anonymous` forward policy, or one whose caller cannot be read): covers and
+  allows nothing, and names no grant. No public constructor makes a reach
+  that names a grant from a list of scopes: that is a gate's answer, and the
+  child seam builds a hop's ceiling as a gate of the hop alone answers it.
 
 ### Changed
 
