@@ -641,6 +641,25 @@ mod tests {
         assert_eq!(answer, 42);
     }
 
+    // RETURNS-47: identity-only keeps the caller's identity whole. The
+    // principal stamp lives in the metadata it otherwise drops, so a `key:`
+    // or `nostr:` caller (whose `user_id` is no idp UUID) lost its name in
+    // the child: `principal()` answered `None`.
+    #[test]
+    fn identity_only_keeps_the_callers_principal_stamp() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let subject: crate::identity::Principal =
+            "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let caller = AuthContext::for_principal(&subject, "s1", vec!["viewer".into()], serde_json::json!({ "k": "v" }));
+        let callee = AuthContext::derive_callee_context(&caller, &ForwardDerivation::IDENTITY_ONLY, &Principal::anonymous_sealed());
+        assert_eq!(callee.principal(), Some(subject), "the identity, whole");
+        assert!(callee.roles.is_empty());
+        assert_eq!(callee.get_metadata_string("k"), None, "and nothing else of the metadata");
+        assert!(callee.is_authenticated());
+    }
+
     #[test]
     fn derive_callee_context_never_grows_context() {
         // Sanity: the constructor cannot fabricate fields that did not
