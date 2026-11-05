@@ -598,6 +598,13 @@ impl Reach {
         Self { held_on: vec![ScopeRef::Everywhere], live: None }
     }
 
+    /// RETURNS-47: nothing — the reach of a call made for no one (a child
+    /// under the `anonymous` forward policy, or one whose caller cannot be
+    /// read). Covers and allows nothing, and names no grant.
+    pub fn nowhere() -> Self {
+        Self { held_on: Vec::new(), live: None }
+    }
+
     /// Whether the grant is held on `*`.
     pub fn is_everywhere(&self) -> bool {
         self.held_on.iter().any(ScopeRef::is_everywhere)
@@ -614,7 +621,7 @@ impl Reach {
         &self.held_on
     }
 
-    /// The grant this reach is for; `None` on a hub without a gate.
+    /// The grant this reach is for; `None` on a service without a gate.
     pub fn grant(&self) -> Option<&Grant> {
         self.live.as_ref().map(|l| &l.grant)
     }

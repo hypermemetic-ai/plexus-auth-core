@@ -6,6 +6,26 @@ at 0.3.0; earlier changes are in the git history (tags `plexus-auth-core-v*`).
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+RETURNS-47: what a child needs to receive auth (owner, 2026-11-04).
+
+### Added
+
+- `Reach::nowhere()`: the reach of a call made for no one (a child under the
+  `anonymous` forward policy, or one whose caller cannot be read): covers and
+  allows nothing, and names no grant. No public constructor makes a reach
+  that names a grant from a list of scopes: that is a gate's answer, and the
+  child seam builds a hop's ceiling as a gate of the hop alone answers it.
+
+### Changed
+
+- A forward derivation that keeps the verified user but not the metadata
+  (`identity_only`) keeps the caller's principal stamp: identity, not
+  metadata. A `key:` or `nostr:` caller (no idp UUID in `user_id`) was named
+  by no one in the callee (`principal()` answered `None`), so an
+  `identity_only` child's `#[from_auth]` verifier refused it.
+
 ## [0.3.0]
 
 Release with plexus-core 0.8.0 (BIDIR-6, BIDIR-17: a method's input half).

@@ -321,6 +321,16 @@ impl AuthContext {
             if let Value::Object(ref mut map) = metadata {
                 map.remove(PRINCIPAL_CLAIM);
             }
+        } else if !derivation.keep_metadata {
+            // RETURNS-47: keeping the verified user keeps its whole identity.
+            // The principal stamp is identity, not metadata: without it a
+            // `key:` or `nostr:` caller (no idp UUID in `user_id`) is named by
+            // no one in the callee.
+            if let Some(stamp) = caller_ctx.metadata.get(PRINCIPAL_CLAIM) {
+                let mut map = serde_json::Map::new();
+                map.insert(PRINCIPAL_CLAIM.to_string(), stamp.clone());
+                metadata = Value::Object(map);
+            }
         }
         AuthContext {
             user_id,
@@ -639,6 +649,25 @@ mod tests {
         let answer =
             caller.with_callee_context(&ForwardDerivation::PASS_THROUGH, &stamp, |_| 42_u32);
         assert_eq!(answer, 42);
+    }
+
+    // RETURNS-47: identity-only keeps the caller's identity whole. The
+    // principal stamp lives in the metadata it otherwise drops, so a `key:`
+    // or `nostr:` caller (whose `user_id` is no idp UUID) lost its name in
+    // the child: `principal()` answered `None`.
+    #[test]
+    fn identity_only_keeps_the_callers_principal_stamp() {
+        use crate::forward::ForwardDerivation;
+        use crate::principal::Principal;
+
+        let subject: crate::identity::Principal =
+            "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let caller = AuthContext::for_principal(&subject, "s1", vec!["viewer".into()], serde_json::json!({ "k": "v" }));
+        let callee = AuthContext::derive_callee_context(&caller, &ForwardDerivation::IDENTITY_ONLY, &Principal::anonymous_sealed());
+        assert_eq!(callee.principal(), Some(subject), "the identity, whole");
+        assert!(callee.roles.is_empty());
+        assert_eq!(callee.get_metadata_string("k"), None, "and nothing else of the metadata");
+        assert!(callee.is_authenticated());
     }
 
     #[test]
