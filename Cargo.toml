@@ -1,6 +1,6 @@
 [package]
 name = "plexus-auth-core"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Sealed-type primitives for the Plexus auth framework: AuthContext, VerifiedUser, Principal."
 license = "MIT"
@@ -100,7 +100,10 @@ tracing = "0.1"
 # signature validation, JWKS (RFC 7517) parsing via `jsonwebtoken::jwk`,
 # and `iss`/`aud`/`exp` claim checks. AUTH-2's spike contract names it as
 # the first-choice library.
-jsonwebtoken = "9"
+#
+# PLEXUS-45: natively it stays 9 (ring), as it was — see the target tables
+# below for wasm32, where ring needs clang and 10's RustCrypto backend
+# does not.
 
 # Default discovery/JWKS HTTP fetcher, gated behind the `oidc-reqwest`
 # feature (see [features]). reqwest 0.12 is the workspace's usual HTTP
@@ -120,6 +123,27 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "z
 # IDENTITY-27: the validator's JWKS refresh is single-flight — concurrent
 # callers wait on one async lock instead of each fetching.
 tokio = { version = "1", default-features = false, features = ["sync"] }
+
+# PLEXUS-45: the crate builds for wasm32-unknown-unknown (a browser crate
+# depends on it through plexus-rpc and plexus-core) with every native
+# dependency unchanged. Native keeps jsonwebtoken 9 on ring, exactly as
+# before; wasm32 takes jsonwebtoken 10 on RustCrypto (pure Rust; ring will
+# not build there without clang) — `src/oidc/` reads the same API from
+# both. Moving native to 10 (aws-lc-rs, a C build in every native consumer)
+# is its own decision, not this one.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonwebtoken = "9"
+
+# wasm32 only: randomness and the clock from the JS runtime (uuid's v4,
+# chrono's `Utc::now`, which otherwise compile and panic at the first call).
+# getrandom 0.3's `wasm_js` also needs `--cfg getrandom_backend="wasm_js"`
+# (this machine's ~/.cargo/config.toml sets it for the target).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+uuid = { version = "1.6", features = ["js"] }
+chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
 
 [dev-dependencies]
 # trybuild drives compile-fail assertions: AuthContext / VerifiedUser /
