@@ -8,7 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-RETURNS-47: what a child needs to receive auth (owner, 2026-11-04).
+## [0.3.1] — 2026-11-06
+
+PLEXUS-45: the crate builds for `wasm32-unknown-unknown` (owner,
+2026-11-06: "can we make plexus core wasm compatible without degrading
+anything?"), with every native dependency unchanged.
+
+### Changed
+
+- **wasm32 only**, by target-specific dependency tables: jsonwebtoken 10 on
+  its RustCrypto backend (ring, which 9 uses, needs clang for wasm32);
+  getrandom 0.3 `wasm_js` and 0.2 `js`, uuid `js` and chrono `wasmbind`, so
+  randomness and `Utc::now` come from the JS runtime rather than panicking.
+  getrandom 0.3 also needs `--cfg getrandom_backend="wasm_js"` in the
+  build's rustflags for the target. `src/oidc/` reads the same API from
+  both jsonwebtoken majors; no source change.
+- **Native: nothing.** jsonwebtoken stays 9 on ring; `cargo tree -e normal`
+  for the host is the same as 0.3.0's, with and without features.
+- The `adapters` feature stays native-only in practice (nostr's secp256k1
+  is a C build).
+
+Also in this release, merged after 0.3.0 — RETURNS-47: what a child needs to receive auth (owner, 2026-11-04).
 
 ### Added
 
