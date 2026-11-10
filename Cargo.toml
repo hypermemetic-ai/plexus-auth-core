@@ -1,6 +1,6 @@
 [package]
 name = "plexus-auth-core"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Sealed-type primitives for the Plexus auth framework: AuthContext, VerifiedUser, Principal."
 license = "MIT"

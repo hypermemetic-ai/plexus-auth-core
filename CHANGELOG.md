@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-11-10
+
+- `Gate::check_everywhere` (KEEL-31): a whole-service method is admitted only
+  where its grant is held on `*`; a grant held on a narrower scope is refused
+  as any other, typed, naming the scope. Additive.
+
 ## [0.3.1] — 2026-11-06
 
 PLEXUS-45: the crate builds for `wasm32-unknown-unknown` (owner,
