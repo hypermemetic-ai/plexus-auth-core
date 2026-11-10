@@ -563,7 +563,9 @@ impl std::error::Error for Refusal {}
 /// hands every method [`Reach::everywhere`], which allows everything.
 #[derive(Clone)]
 pub struct Reach {
-    held_on: Vec<ScopeRef>,
+    /// PERF.115-49: borrowed for the two constant answers (everywhere,
+    /// nowhere), so a service without a gate allocates nothing for them.
+    held_on: std::borrow::Cow<'static, [ScopeRef]>,
     live: Option<Live>,
 }
 
@@ -609,14 +611,15 @@ impl Reach {
     /// Everything — what a method receives on a hub without a gate (login
     /// off), as today.
     pub fn everywhere() -> Self {
-        Self { held_on: vec![ScopeRef::Everywhere], live: None }
+        static EVERYWHERE: [ScopeRef; 1] = [ScopeRef::Everywhere];
+        Self { held_on: std::borrow::Cow::Borrowed(&EVERYWHERE), live: None }
     }
 
     /// RETURNS-47: nothing — the reach of a call made for no one (a child
     /// under the `anonymous` forward policy, or one whose caller cannot be
     /// read). Covers and allows nothing, and names no grant.
     pub fn nowhere() -> Self {
-        Self { held_on: Vec::new(), live: None }
+        Self { held_on: std::borrow::Cow::Borrowed(&[]), live: None }
     }
 
     /// Whether the grant is held on `*`.
@@ -633,6 +636,15 @@ impl Reach {
     /// The scopes the grant is held on; `[*]` when everywhere.
     pub fn held_on(&self) -> &[ScopeRef] {
         &self.held_on
+    }
+
+    /// PERF.115-49: the caller this reach was decided for — the context the
+    /// gate was asked about, which it keeps to ask again; `None` for an
+    /// anonymous caller and for a reach no gate made ([`Reach::everywhere`],
+    /// [`Reach::nowhere`]). Lets a holder of the reach read that caller
+    /// rather than keep a second copy of it.
+    pub fn caller(&self) -> Option<&AuthContext> {
+        self.live.as_ref().and_then(|l| l.caller.as_ref())
     }
 
     /// The grant this reach is for; `None` on a service without a gate.
@@ -873,6 +885,13 @@ impl Gate {
         if caller.principal().is_none() {
             return Ok(());
         }
+        self.alive_named(caller)
+    }
+
+    /// [`Gate::alive`] for a caller whose principal was just read (PERF.115-49:
+    /// [`Gate::check`] has it from [`Gate::caller_of`], and does not parse it
+    /// again).
+    fn alive_named(&self, caller: &AuthContext) -> Result<(), String> {
         if caller.expired() {
             return Err("your sign-in has expired: sign in again".into());
         }
@@ -1031,7 +1050,7 @@ impl Gate {
             return Err(Refusal::Unauthenticated);
         };
         if let Some(ctx) = caller {
-            self.alive(ctx).map_err(|reason| Refusal::Ended { reason })?;
+            self.alive_named(ctx).map_err(|reason| Refusal::Ended { reason })?;
         }
         let held_on = self.held_on_for(&principal, &layers, grant);
         let (allowed, scope) = match target {
@@ -1056,7 +1075,7 @@ impl Gate {
         };
         if allowed {
             Ok(Reach {
-                held_on,
+                held_on: held_on.into(),
                 live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere: false }),
             })
         } else {
@@ -1084,13 +1103,13 @@ impl Gate {
                 grant: grant.clone(),
                 scope: ScopeRef::Everywhere,
                 roles: self.roles_listing(grant),
-                held_on: reach.held_on,
+                held_on: reach.held_on.into_owned(),
             });
         }
-        Ok(Reach {
-            held_on: reach.held_on,
-            live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere: true }),
-        })
+        // PERF.115-49: the check's own live part (this gate, this caller,
+        // this grant), kept by the rule of `*` — not a second copy of each.
+        let live = reach.live.map(|live| Live { everywhere: true, ..live });
+        Ok(Reach { held_on: reach.held_on, live })
     }
 
     /// The reach of a `public` method: what [`Gate::check`] would allow
@@ -1098,7 +1117,7 @@ impl Gate {
     /// the grant nowhere or is anonymous. A public method is never refused.
     pub fn reach_of_public(&self, caller: Option<&AuthContext>, grant: &Grant) -> Reach {
         self.check(caller, grant, None).unwrap_or_else(|_| Reach {
-            held_on: Vec::new(),
+            held_on: std::borrow::Cow::Borrowed(&[]),
             live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere: false }),
         })
     }

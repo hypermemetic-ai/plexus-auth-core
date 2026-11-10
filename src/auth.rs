@@ -26,6 +26,36 @@ use serde_json::Value;
 /// rather than in a field of its own.
 pub const PRINCIPAL_CLAIM: &str = "principal";
 
+/// PERF.115-49: `raw` parsed as a principal — remembered for the last stamp
+/// this thread parsed, so a call that asks for its caller's principal three
+/// times (the liveness check, the gate's check and its own liveness check)
+/// validates it once. The memory is derived only: a private thread-local,
+/// written here and nowhere else, holding a stamp's exact text beside what
+/// [`str::parse`] made of it, and answered only for a byte-equal stamp —
+/// so it answers exactly what parsing would. Nothing outside this function
+/// can put a principal in it, and an `AuthContext` carries none of its own.
+fn parse_claim(raw: &str) -> Option<crate::identity::Principal> {
+    use crate::identity::Principal;
+    use std::cell::RefCell;
+    thread_local! {
+        static LAST: RefCell<Option<(Box<str>, Principal)>> = const { RefCell::new(None) };
+    }
+    let hit = LAST
+        .try_with(|last| last.try_borrow().ok().and_then(|l| l.as_ref().filter(|(text, _)| &**text == raw).map(|(_, p)| p.clone())))
+        .ok()
+        .flatten();
+    if hit.is_some() {
+        return hit;
+    }
+    let parsed = raw.parse::<Principal>().ok()?;
+    let _ = LAST.try_with(|last| {
+        if let Ok(mut last) = last.try_borrow_mut() {
+            *last = Some((raw.into(), parsed.clone()));
+        }
+    });
+    Some(parsed)
+}
+
 /// Per-connection authentication context, populated during WS upgrade.
 ///
 /// This context is extracted from HTTP cookies (or other auth mechanisms) during
@@ -167,15 +197,13 @@ impl AuthContext {
     ///
     /// [`Authenticated::into_auth_context`]: crate::identity::Authenticated::into_auth_context
     pub fn principal(&self) -> Option<crate::identity::Principal> {
-        if let Some(raw) = self.get_metadata_string(PRINCIPAL_CLAIM) {
-            if let Ok(p) = raw.parse::<crate::identity::Principal>() {
-                return Some(p);
-            }
+        // PERF.115-49: the stamp read in place (no copy of it).
+        if let Some(raw) = self.metadata.get(PRINCIPAL_CLAIM).and_then(Value::as_str) {
             // A present-but-unparseable stamp is a corrupt claim. Falling
             // through to the `user_id` derivation would answer a different
             // question than the one the stamp was trying to answer, so this
             // is a hard `None`.
-            return None;
+            return parse_claim(raw);
         }
         crate::identity::Principal::from_legacy_user_id(&self.user_id)
     }
@@ -462,6 +490,35 @@ pub trait SessionValidator: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PERF.115-49: the remembered parse answers exactly what parsing
+    /// answers — for the stamp it was taken of, for another stamp, for a
+    /// corrupt one after a good one, and after a context's stamp is
+    /// rewritten in place.
+    #[test]
+    fn the_remembered_principal_is_always_the_stamps_own() {
+        let ada = format!("key:{}", "a".repeat(64));
+        let bob = format!("key:{}", "b".repeat(64));
+        let stamped = |p: &str| AuthContext::new("u".into(), "s".into(), vec![], serde_json::json!({ PRINCIPAL_CLAIM: p }));
+        let fresh = |ctx: &AuthContext| ctx.metadata[PRINCIPAL_CLAIM].as_str().and_then(|s| s.parse::<crate::identity::Principal>().ok());
+        let (a, b) = (stamped(&ada), stamped(&bob));
+        for _ in 0..3 {
+            assert_eq!(a.principal(), fresh(&a));
+            assert_eq!(b.principal(), fresh(&b));
+            assert_eq!(a.principal().unwrap().to_string(), ada);
+        }
+        // A corrupt stamp right after a good one is still `None`.
+        assert_eq!(a.principal().unwrap().to_string(), ada);
+        assert_eq!(stamped(&format!("key:{}", "A".repeat(64))).principal(), None);
+        assert_eq!(stamped(&format!("{ada}x")).principal(), None);
+        // The pub fields rewritten in place: the next answer is the new stamp's.
+        let mut c = stamped(&ada);
+        assert_eq!(c.principal().unwrap().to_string(), ada);
+        c.metadata[PRINCIPAL_CLAIM] = serde_json::Value::String(bob.clone());
+        assert_eq!(c.principal().unwrap().to_string(), bob);
+        c.metadata = serde_json::Value::Null;
+        assert_eq!(c.principal(), None);
+    }
 
     #[test]
     fn test_auth_context_creation() {
