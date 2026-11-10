@@ -572,6 +572,20 @@ struct Live {
     gate: Gate,
     caller: Option<AuthContext>,
     grant: Grant,
+    /// KEEL-31: the reach of a method that acts on the whole service — asked
+    /// again by [`Gate::check_everywhere`], so it lasts only while the grant
+    /// is held on `*`.
+    everywhere: bool,
+}
+
+impl Live {
+    /// The gate's answer now, by the rule this reach was given by.
+    fn now(&self) -> Result<Reach, Refusal> {
+        match self.everywhere {
+            true => self.gate.check_everywhere(self.caller.as_ref(), &self.grant),
+            false => self.gate.check(self.caller.as_ref(), &self.grant, None),
+        }
+    }
 }
 
 impl fmt::Debug for Reach {
@@ -635,10 +649,12 @@ impl Reach {
     }
 
     /// Whether the call may act on `target` — asked of the gate as it
-    /// stands now. Without a gate: always.
+    /// stands now. Without a gate: always. KEEL-31: a whole-service
+    /// method's reach allows a target only while the grant is held on `*`.
     pub fn allows(&self, target: &str) -> bool {
         match &self.live {
             None => self.is_everywhere(),
+            Some(l) if l.everywhere => l.now().is_ok(),
             Some(l) => l.gate.check(l.caller.as_ref(), &l.grant, Some(target)).is_ok(),
         }
     }
@@ -648,7 +664,7 @@ impl Reach {
     pub fn current(&self) -> Option<Reach> {
         match &self.live {
             None => Some(self.clone()),
-            Some(l) => l.gate.check(l.caller.as_ref(), &l.grant, None).ok(),
+            Some(l) => l.now().ok(),
         }
     }
 
@@ -663,7 +679,7 @@ impl Reach {
     pub fn recheck(&self) -> Result<Reach, Refusal> {
         match &self.live {
             None => Ok(self.clone()),
-            Some(l) => l.gate.check(l.caller.as_ref(), &l.grant, None),
+            Some(l) => l.now(),
         }
     }
 
@@ -1041,11 +1057,40 @@ impl Gate {
         if allowed {
             Ok(Reach {
                 held_on,
-                live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone() }),
+                live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere: false }),
             })
         } else {
             Err(Refusal::MissingGrant { grant: grant.clone(), scope, roles: self.roles_listing(grant), held_on })
         }
+    }
+
+    /// KEEL-31: the check for a method that acts on the whole service (it
+    /// names no target because its target is everything: a key rotated, a
+    /// process spawned, a peer connected). Allowed only where the grant is
+    /// held on `*` — by a role held on `*` that lists it, and every ceiling
+    /// layer allowing it on `*` — never because it is held on some scope. A
+    /// scoped `admin`, or a session minted `admin@X`, is refused, naming `*`.
+    /// The reach is `[*]` and stays live by this same rule.
+    pub fn check_everywhere(&self, caller: Option<&AuthContext>, grant: &Grant) -> Result<Reach, Refusal> {
+        let reach = match self.check(caller, grant, None) {
+            Ok(reach) => reach,
+            Err(Refusal::MissingGrant { grant, roles, held_on, .. }) => {
+                return Err(Refusal::MissingGrant { grant, scope: ScopeRef::Everywhere, roles, held_on })
+            }
+            Err(other) => return Err(other),
+        };
+        if !reach.is_everywhere() {
+            return Err(Refusal::MissingGrant {
+                grant: grant.clone(),
+                scope: ScopeRef::Everywhere,
+                roles: self.roles_listing(grant),
+                held_on: reach.held_on,
+            });
+        }
+        Ok(Reach {
+            held_on: reach.held_on,
+            live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere: true }),
+        })
     }
 
     /// The reach of a `public` method: what [`Gate::check`] would allow
@@ -1054,7 +1099,7 @@ impl Gate {
     pub fn reach_of_public(&self, caller: Option<&AuthContext>, grant: &Grant) -> Reach {
         self.check(caller, grant, None).unwrap_or_else(|_| Reach {
             held_on: Vec::new(),
-            live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone() }),
+            live: Some(Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere: false }),
         })
     }
 }
@@ -1372,5 +1417,42 @@ mod tests {
         assert_eq!(gate.held_on_by(&narrowed, &g("tickets.get")), vec![ScopeRef::named("MENGER-12")]);
         m.revoke_all();
         assert_ne!(gate.fingerprint(&who(ADA)).unwrap(), ada, "a revoke: another fingerprint");
+    }
+
+    /// KEEL-31 (the review's probe, KEEL-28): `admin` held on one ticket is
+    /// admitted to a method with no target by [`Gate::check`] — held
+    /// somewhere — and refused by [`Gate::check_everywhere`], naming `*`; so
+    /// is a session minted narrower than `*`. Held on `*`, it is allowed,
+    /// and its reach stays live by the same rule.
+    #[test]
+    fn a_whole_service_method_needs_its_grant_on_everywhere() {
+        let m = Arc::new(Members::default());
+        m.grant(ADA, "admin", "MENGER-5");
+        m.grant(BOB, "admin", "*");
+        let gate = gate(&m);
+        let grow = g("dyn.grow");
+        assert_eq!(gate.check(Some(&who(ADA)), &grow, None).unwrap().held_on(), [ScopeRef::named("MENGER-5")]);
+        match gate.check_everywhere(Some(&who(ADA)), &grow) {
+            Err(Refusal::MissingGrant { scope, held_on, .. }) => {
+                assert_eq!(scope, ScopeRef::Everywhere);
+                assert_eq!(held_on, [ScopeRef::named("MENGER-5")]);
+            }
+            other => panic!("a scoped admin: {other:?}"),
+        }
+        let reach = gate.check_everywhere(Some(&who(BOB)), &grow).unwrap();
+        assert!(reach.is_everywhere());
+        for ceiling in [serde_json::json!(["admin@MENGER-5"]), serde_json::json!(["viewer@*"]), serde_json::json!("admin@*")] {
+            let capped = with_ceiling(BOB, ceiling.clone());
+            assert!(gate.check_everywhere(Some(&capped), &grow).is_err(), "ceiling {ceiling}");
+        }
+        assert!(gate.check_everywhere(Some(&with_ceiling(BOB, serde_json::json!(["dyn.grow@*"]))), &grow).is_ok());
+        assert!(gate.check_everywhere(Some(&with_ceiling(ADA, serde_json::json!(["admin@*"]))), &grow).is_err(), "a ceiling never widens");
+        assert_eq!(gate.check_everywhere(None, &grow).err(), Some(Refusal::Unauthenticated));
+        // Live: narrowed to a scope while it runs, the reach is gone.
+        m.revoke_all();
+        m.grant(BOB, "admin", "MENGER");
+        assert!(reach.current().is_none());
+        assert!(reach.recheck().is_err());
+        assert!(!reach.allows("MENGER-1"));
     }
 }
