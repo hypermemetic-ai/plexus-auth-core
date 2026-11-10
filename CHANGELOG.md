@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-11-10
+
+- Performance (PERF.115-49), no decision changed: a principal is parsed once a
+  stamp (remembered per thread, by the stamp's exact text); `Reach::everywhere()`
+  and `nowhere()` allocate nothing; `Reach::caller()` is new (additive). A gate
+  check costs 3,585 instructions where it cost 6,055.
+
 ## [0.3.2] — 2026-11-10
 
 - `Gate::check_everywhere` (KEEL-31): a whole-service method is admitted only
