@@ -6,7 +6,8 @@ description = "Sealed-type primitives for the Plexus auth framework: AuthContext
 license = "MIT"
 repository = "https://github.com/hypermemetic-ai/plexus-auth-core"
 # DIST-2: the published crate is the library and its licence.
-include = ["src/**", "LICENSE", "CHANGELOG.md", "Cargo.toml"]
+readme = "README.md"
+include = ["src/**", "LICENSE", "CHANGELOG.md", "README.md", "Cargo.toml"]
 
 # Why this is its own crate:
 #

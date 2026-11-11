@@ -182,3 +182,8 @@ pub use tenant::{
     Tenanted, UnknownRole,
 };
 pub use verified_user::VerifiedUser;
+
+/// README.md's example, run by `cargo test --doc`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
