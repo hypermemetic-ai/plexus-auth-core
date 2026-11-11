@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-11-11
+
+ONE-6 (build 1 of ONE-4): a role can be held on an **address**. Additive and
+inert until a dispatcher tells the gate where a call is (plexus-core, build 2);
+no public signature changes.
+
+### Added
+
+- Two scope forms a membership or a ceiling entry may be held on:
+  `/dyn` — the methods of the activation `dyn`, or with `/dyn.connect` that
+  one method, and nothing mounted beneath; `/dyn.*` — `dyn` and everything
+  beneath it (`/dyn.peer.shop.*` is one peer). `self` is `*`: the service
+  being called, never the caller.
+- `ScopeRef::parse_checked` (strict: segments of `A-Z a-z 0-9 _ -`, an
+  optional trailing `.*`, nothing else), `ScopeRef::is_address`,
+  `ScopeRef::covers_address`.
+- `CallAddress::new(activation, method)` — a call's literal address, the
+  method one segment, so a path is told apart at its last dot only.
+- `Gate::check_at`, `Gate::check_everywhere_at`, `Gate::reach_of_public_at`:
+  the checks, told the call's address. An address scope holds a grant only
+  inside a call it covers, and there stands as `*` (in the decision, in
+  `Reach.held_on`, and as a ceiling layer). A whole-service method is
+  admitted on `*`, its activation's address, its own, or a `.*` above it;
+  never on a data scope (KEEL-31). A refusal there names `/<activation>`.
+
+### Changed
+
+- The gate owns addresses: a scope beginning with `/` is never a data scope.
+  Told no address (`check`, `check_everywhere`, `held_on`, `held_on_by`,
+  `reach_of_public`), it holds nothing; a `Resolve` chain that names one has
+  it dropped. A service whose own data scopes began with `/` loses them (none
+  is known). Every other answer is as it was.
+
 ## [0.3.3] — 2026-11-10
 
 - Performance (PERF.115-49), no decision changed: a principal is parsed once a
