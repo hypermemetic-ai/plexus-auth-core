@@ -14,6 +14,12 @@ ONE-6 (build 1 of ONE-4): a role can be held on an **address**. Additive and
 inert until a dispatcher tells the gate which call it is deciding
 (plexus-core, build 2); no existing public signature changes.
 
+**Activation scopes and data scopes are separate** (owner, 2026-11-11:
+"activation and data scopes are separate. we can only generally handle
+activation scopes. data scopes must be handled by the application"). An
+address scope answers one question — may this caller make this call at this
+address (the door) — and never stands for data.
+
 ### Added
 
 - Two scope forms a membership or a ceiling entry may be held on:
@@ -31,22 +37,26 @@ inert until a dispatcher tells the gate which call it is deciding
   routed segments a key holding a dot is refused rather than split.
 - `DispatchedCall::new(address, grant)` — one dispatched call: its address and
   the grant it dispatches to, paired once by the dispatcher.
-- `Gate::check_at(caller, &call, target)`, `Gate::check_everywhere_at(caller,
-  &call)`, `Gate::reach_of_public_at(caller, &call)`: the checks of a
-  dispatched call, for its own grant. An address scope holds a grant only
-  inside a call it covers and only for that call's grant, and there stands as
-  `*` (in the decision, in `Reach.held_on`, and as a ceiling layer). Any other
-  check — a second grant inside the call, a seam, a store's sub-check — goes
-  through `check` / `check_everywhere`, where an address scope holds nothing.
-  A whole-service method is admitted on `*`, its activation's address, its
-  own, or a `.*` above it; never on a data scope (KEEL-31). A refusal there
-  names `/<activation>`.
+- `Gate::check_everywhere_at(caller, &call)` — the door, for the call's own
+  grant: admitted on `*`, the activation's address, the method's own, or a
+  `.*` above it, within every ceiling layer; never on a data scope (KEEL-31).
+  A refusal names `/<activation>`. Its reach's `held_on` is the caller's data
+  scopes for the grant (`[]` for one holding only addresses).
+- `Reach::holds_activation()` — the grant is held for the whole of the call's
+  activation: on `*`, or at the door. `Reach::is_everywhere()` keeps its
+  meaning: a real `*` only. A backstop on a whole-service method asks the
+  first; one that means "every data scope" asks the second.
+- Decided for the three shapes (crate docs, `grants`): an address scope
+  admits at the door (`everywhere` methods; calls into an untyped peer slot,
+  build 2) and counts for nothing in `check` — not for a target, not as "held
+  anywhere" for a targetless read, which is refused to a caller holding only
+  addresses.
 
 ### Changed — behavior, even with no address passed
 
 - **A scope beginning with `/` is never a data scope.** A membership or
-  ceiling entry on one holds nothing unless a dispatched call it covers is
-  being decided, and a `Resolve` chain that names one has it dropped (so a
+  ceiling entry on one holds no data anywhere and opens only the door of a
+  dispatched call it covers; a `Resolve` chain that names one has it dropped (so a
   target whose own scopes begin with `/` can be held only through `*`).
   Why: the gate owns addresses — if a `/` name could still be a service's
   data scope, a resolver (or a target value it echoes) could forge an

@@ -1,12 +1,16 @@
 //! ONE-6: a role held on an address. `/dyn` is dyn's own methods (and
 //! `/dyn.connect` that one method); `/dyn.*` is dyn and everything mounted
-//! under it; `self` is `*`, the service being called. An address scope
-//! holds a grant only inside a call it covers, and there it reads as `*`.
+//! under it; `self` is `*`, the service being called.
+//!
+//! Activation scopes and data scopes are separate (owner, 2026-11-11): an
+//! address scope opens the door of the calls it covers — a whole-service
+//! method, a call into a peer — and never stands for data.
 
 use std::sync::{Arc, Mutex};
 
 use plexus_auth_core::grants::{
-    CallAddress, DispatchedCall, Gate, Grant, Membership, Memberships, Reach, Refusal, Resolve, RoleTable, ScopeRef, CEILING_KEY,
+    CallAddress, DispatchedCall, Gate, Grant, Membership, Memberships, Reach, Refusal, Resolve, RoleTable, ScopeRef,
+    CEILING_KEY,
 };
 use plexus_auth_core::identity::Principal;
 use plexus_auth_core::{AuthContext, RoleName};
@@ -113,40 +117,36 @@ impl Ada {
         self
     }
 
-    fn reach(&self, path: &str) -> Result<Reach, Refusal> {
-        self.gate.check_at(Some(&self.session), &call(path), None)
-    }
-
-    /// May she make this call (no target)?
+    /// At the door: may she make this whole-service call, or this call
+    /// into a peer?
     fn may(&self, path: &str) -> bool {
-        self.reach(path).is_ok()
+        self.door(path).is_ok()
     }
 
-    /// May she make this call on that target?
-    fn may_on(&self, path: &str, target: &str) -> bool {
-        self.gate.check_at(Some(&self.session), &call(path), Some(target)).is_ok()
+    fn door(&self, path: &str) -> Result<Reach, Refusal> {
+        self.gate.check_everywhere_at(Some(&self.session), &call(path))
     }
 
-    /// May she call this whole-service method?
-    fn may_everywhere(&self, path: &str) -> bool {
-        self.refused_everywhere(path).is_none()
+    /// May she read this ticket?
+    fn reads(&self, ticket: &str) -> bool {
+        self.gate.check(Some(&self.session), &Grant::new("tickets.get"), Some(ticket)).is_ok()
     }
 
-    fn refused_everywhere(&self, path: &str) -> Option<Refusal> {
-        self.gate.check_everywhere_at(Some(&self.session), &call(path)).err()
+    /// What a ticket list answers her from — `None` when it is refused.
+    fn lists_from(&self) -> Option<Vec<ScopeRef>> {
+        self.gate.check(Some(&self.session), &Grant::new("tickets.list"), None).ok().map(|r| r.held_on().to_vec())
     }
 
     /// Inside a call, may she use another grant — a second check, a seam,
-    /// a store's sub-check, which is told no address?
+    /// a store's sub-check, which is told no call?
     fn may_also(&self, grant: &str) -> bool {
         self.gate.check(Some(&self.session), &Grant::new(grant), None).is_ok()
             || self.gate.check_everywhere(Some(&self.session), &Grant::new(grant)).is_ok()
     }
 
-    /// Is the grant "held anywhere" by the gate's old, addressless word?
+    /// Is the grant "held anywhere"?
     fn holds_anywhere(&self, grant: &str) -> bool {
         !self.gate.held_on(&self.session, &Grant::new(grant)).is_empty()
-            || self.gate.check(Some(&self.session), &Grant::new(grant), None).is_ok()
     }
 
     fn loses_everything(&self) {
@@ -154,7 +154,11 @@ impl Ada {
     }
 }
 
-// --- what each scope reaches -------------------------------------------------
+fn kiln() -> Vec<ScopeRef> {
+    vec![ScopeRef::named("KILN")]
+}
+
+// --- the door: what each address opens -----------------------------------------
 
 #[test]
 fn an_operator_on_dyn_may_connect_but_not_call_into_a_peer() {
@@ -198,62 +202,21 @@ fn an_operator_on_ui_may_neither_connect_nor_call_a_peer() {
 }
 
 #[test]
-fn an_operator_on_ui_holds_no_read_elsewhere() {
-    let ada = ada(&["operator on /ui"]);
-    assert!(!ada.may("tickets.list"));
-    assert!(!ada.may_on("tickets.get", "KILN-1"));
-    assert!(!ada.holds_anywhere("tickets.list"));
-}
-
-#[test]
-fn self_is_the_service_being_called() {
-    assert_eq!(ScopeRef::parse_checked("self"), Ok(ScopeRef::Everywhere));
-    let ada = ada(&["operator on self"]);
-    assert!(ada.may("dyn.connect") && ada.may("dyn.peer.shop.items.list") && ada.may("tickets.list"));
-    assert!(ada.may_everywhere("dyn.connect"));
-}
-
-// --- inside a call it covers, an address reads as `*` -----------------------
-
-#[test]
-fn inside_the_call_an_address_reads_as_everywhere() {
-    let ada = ada(&["viewer on /tickets"]);
-    let reach = ada.reach("tickets.list").unwrap();
-    assert!(reach.is_everywhere());
-    assert_eq!(reach.held_on(), [ScopeRef::Everywhere]);
-    assert!(reach.allows("KILN-1"));
-    assert!(ada.may_on("tickets.get", "KILN-1"));
-}
-
-#[test]
-fn a_reach_on_an_address_ends_when_the_membership_does() {
-    let ada = ada(&["operator on /dyn.*"]);
-    let reach = ada.reach("dyn.peer.shop.items.list").unwrap();
-    ada.loses_everything();
-    assert!(reach.current().is_none());
-    assert!(!reach.allows("KILN-1"));
-}
-
-// --- the whole-service methods (KEEL-31 stays shut) --------------------------
-
-#[test]
 fn a_whole_service_method_is_held_on_its_own_address_or_above() {
     for scope in ["*", "self", "/dyn", "/dyn.connect", "/dyn.*"] {
-        let ada = ada(&[&format!("operator on {scope}")]);
-        assert!(ada.may_everywhere("dyn.connect"), "operator on {scope}");
+        assert!(ada(&[&format!("operator on {scope}")]).may("dyn.connect"), "operator on {scope}");
     }
-    for scope in ["/ui", "/ui.*", "/dyn.peer.*", "/dyn.peer.shop.*", "/dyn.disconnect", "/dynamo"] {
-        let ada = ada(&[&format!("operator on {scope}")]);
-        assert!(!ada.may_everywhere("dyn.connect"), "operator on {scope}");
+    for scope in ["/ui", "/ui.*", "/dyn.peer.*", "/dyn.peer.shop.*", "/dyn.disconnect", "/dynamo", "KILN"] {
+        assert!(!ada(&[&format!("operator on {scope}")]).may("dyn.connect"), "operator on {scope}");
     }
 }
 
 #[test]
 fn an_admin_on_a_data_scope_is_still_refused_a_whole_service_method() {
     let ada = ada(&["admin on KILN", "admin on KILN-1"]);
-    assert!(ada.may_on("tickets.get", "KILN-1"));
-    match ada.refused_everywhere("dyn.connect") {
-        Some(Refusal::MissingGrant { scope, held_on, .. }) => {
+    assert!(ada.reads("KILN-1"));
+    match ada.door("dyn.connect") {
+        Err(Refusal::MissingGrant { scope, held_on, .. }) => {
             assert_eq!(scope, ScopeRef::named("/dyn"), "the refusal names the activation");
             assert_eq!(held_on, [ScopeRef::named("KILN"), ScopeRef::named("KILN-1")]);
         }
@@ -262,28 +225,115 @@ fn an_admin_on_a_data_scope_is_still_refused_a_whole_service_method() {
     assert!(ada.gate.check_everywhere(Some(&ada.session), &Grant::new("dyn.connect")).is_err());
 }
 
-// --- a ceiling of an address caps as a data ceiling caps ---------------------
+#[test]
+fn self_is_the_service_being_called() {
+    assert_eq!(ScopeRef::parse_checked("self"), Ok(ScopeRef::Everywhere));
+    let ada = ada(&["operator on self"]);
+    assert!(ada.may("dyn.connect") && ada.may("dyn.peer.shop.items.list"));
+    assert!(ada.reads("KILN-1"));
+    assert_eq!(ada.lists_from(), Some(vec![ScopeRef::Everywhere]));
+}
+
+// --- an address never stands for data (owner, 2026-11-11) ---------------------
 
 #[test]
-fn a_session_capped_to_an_address_reaches_only_inside_it() {
-    let ada = ada(&["admin on *"]).capped_to(&["admin@/dyn"]);
-    assert!(ada.may("dyn.connect"));
-    assert!(ada.may_everywhere("dyn.connect"));
-    assert!(!ada.may("dyn.peer.shop.items.list"));
-    assert!(!ada.may("tickets.list"));
-    assert!(!ada.may_on("tickets.get", "KILN-1"));
+fn a_viewer_on_tickets_reads_no_organizations_tickets() {
+    let ada = ada(&["viewer on /tickets.*"]);
+    assert!(!ada.reads("OTHERORG-1"));
+    assert!(!ada.reads("KILN-1"));
+    assert_eq!(ada.lists_from(), None, "a list is refused, never all organizations");
     assert!(!ada.holds_anywhere("tickets.list"));
 }
 
 #[test]
-fn a_session_capped_to_a_data_scope_cannot_use_an_address_membership_everywhere() {
-    let on_dyn = ada(&["operator on /dyn.*"]).capped_to(&["operator@KILN"]);
-    let on_all = ada(&["operator on *"]).capped_to(&["operator@KILN"]);
-    assert!(!on_dyn.may_everywhere("dyn.connect"));
-    // A read inside the address answers from KILN alone, as `*` capped to KILN does.
-    let kiln = [ScopeRef::named("KILN")];
-    assert_eq!(on_dyn.reach("dyn.peer.shop.items.list").unwrap().held_on(), kiln);
-    assert_eq!(on_all.reach("dyn.peer.shop.items.list").unwrap().held_on(), kiln);
+fn a_viewer_on_tickets_and_on_kiln_reads_kiln_alone() {
+    let ada = ada(&["viewer on /tickets.*", "viewer on KILN"]);
+    assert!(ada.reads("KILN-1"));
+    assert!(!ada.reads("OTHERORG-1"));
+    assert_eq!(ada.lists_from(), Some(kiln()));
+}
+
+#[test]
+fn an_operator_on_ui_holds_no_read_anywhere() {
+    let ada = ada(&["operator on /ui"]);
+    assert!(!ada.reads("KILN-1"));
+    assert_eq!(ada.lists_from(), None);
+    assert!(!ada.holds_anywhere("tickets.list"));
+}
+
+// --- what a door's reach says -------------------------------------------------
+
+#[test]
+fn a_reach_through_the_door_holds_the_activation_and_no_data() {
+    let ada = ada(&["operator on /dyn"]);
+    let reach = ada.door("dyn.connect").unwrap();
+    assert!(reach.holds_activation());
+    assert!(!reach.is_everywhere(), "an address is not `*`");
+    assert!(reach.held_on().is_empty());
+    assert!(!reach.allows("KILN-1"));
+}
+
+#[test]
+fn a_reach_through_the_door_holds_only_the_data_scopes_held() {
+    let ada = ada(&["operator on /dyn", "operator on KILN"]);
+    let reach = ada.door("dyn.connect").unwrap();
+    assert!(reach.holds_activation() && !reach.is_everywhere());
+    assert_eq!(reach.held_on(), kiln());
+    assert!(reach.allows("KILN-1"));
+    assert!(!reach.allows("OTHERORG-1"));
+}
+
+#[test]
+fn an_admin_everywhere_holds_the_activation_and_all_data() {
+    let reach = ada(&["admin on *"]).door("dyn.connect").unwrap();
+    assert!(reach.holds_activation() && reach.is_everywhere());
+    assert!(reach.allows("OTHERORG-1"));
+}
+
+#[test]
+fn a_data_reach_never_holds_an_activation() {
+    let ada = ada(&["viewer on KILN"]);
+    let reach = ada.gate.check(Some(&ada.session), &Grant::new("tickets.list"), None).unwrap();
+    assert!(!reach.holds_activation());
+    assert!(Reach::everywhere().holds_activation(), "without a gate, everything");
+    assert!(!Reach::nowhere().holds_activation());
+}
+
+#[test]
+fn a_reach_through_the_door_ends_when_the_membership_does() {
+    let ada = ada(&["operator on /dyn.*"]);
+    let reach = ada.door("dyn.peer.shop.items.list").unwrap();
+    assert!(reach.current().is_some_and(|r| r.holds_activation()));
+    ada.loses_everything();
+    assert!(reach.current().is_none());
+    assert!(reach.recheck().is_err());
+}
+
+// --- ceilings ----------------------------------------------------------------------
+
+#[test]
+fn a_session_capped_to_an_address_opens_that_door_alone_and_reads_nothing() {
+    let ada = ada(&["admin on *"]).capped_to(&["admin@/dyn"]);
+    assert!(ada.may("dyn.connect"));
+    assert!(!ada.may("dyn.peer.shop.items.list"));
+    assert!(!ada.reads("KILN-1"));
+    assert_eq!(ada.lists_from(), None);
+}
+
+#[test]
+fn a_session_capped_to_a_data_scope_opens_no_door() {
+    let ada = ada(&["operator on /dyn.*", "operator on *"]).capped_to(&["operator@KILN"]);
+    assert!(!ada.may("dyn.connect"));
+    assert!(ada.reads("KILN-1"));
+    assert!(!ada.reads("OTHERORG-1"));
+}
+
+#[test]
+fn a_ceiling_still_narrows_the_data_beside_an_address() {
+    let ada = ada(&["viewer on /tickets.*", "viewer on *"]).capped_to(&["viewer@KILN"]);
+    assert!(ada.reads("KILN-1"));
+    assert!(!ada.reads("OTHERORG-1"));
+    assert_eq!(ada.lists_from(), Some(kiln()));
 }
 
 #[test]
@@ -296,8 +346,58 @@ fn a_ceiling_on_an_address_never_widens() {
 #[test]
 fn a_ceiling_naming_one_grant_on_an_address_allows_that_grant_there() {
     let ada = ada(&["admin on *"]).capped_to(&["dyn.connect@/dyn"]);
-    assert!(ada.may_everywhere("dyn.connect"));
+    assert!(ada.may("dyn.connect"));
     assert!(!ada.may("dyn.disconnect"));
+}
+
+// --- the grant is tied to the address (review F1) ----------------------------
+
+#[test]
+fn an_operator_on_one_method_holds_no_other_grant_inside_that_call() {
+    let ada = ada(&["operator on /dyn.connect"]);
+    assert!(ada.may("dyn.connect"));
+    assert!(!ada.may_also("dyn.disconnect"));
+}
+
+#[test]
+fn an_admin_on_dyn_cannot_grant_roles_from_inside_connect() {
+    let ada = ada(&["admin on /dyn"]);
+    assert!(ada.may("dyn.connect"));
+    assert!(!ada.may_also("auth.grant"));
+}
+
+// --- one spelling for the root (review F3) -----------------------------------
+
+#[test]
+fn self_stored_raw_holds_nothing_anywhere() {
+    for raw in [ScopeRef::parse("self"), serde_json::from_str::<ScopeRef>("\"self\"").unwrap()] {
+        assert_eq!(raw, ScopeRef::named("self"), "the lenient spelling is a name");
+        let ada = ada(&[]).also_holds_raw("admin", raw.as_str());
+        assert!(!ada.may("dyn.connect"));
+        assert!(!ada.reads("KILN-1"));
+        assert!(!ada.holds_anywhere("tickets.list"));
+        assert!(!ada.may_also("auth.grant"));
+    }
+}
+
+#[test]
+fn a_ceiling_of_self_stored_raw_allows_nothing() {
+    let ada = ada(&["admin on *"]).capped_to(&["admin@self"]);
+    assert!(!ada.may("dyn.connect"));
+    assert!(!ada.reads("KILN-1"));
+    assert!(!ada.holds_anywhere("tickets.list"));
+}
+
+#[test]
+fn a_resolver_cannot_name_self_in_a_chain() {
+    struct Selfish;
+    impl Resolve for Selfish {
+        fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::named(target), ScopeRef::named("self")])
+        }
+    }
+    let ada = ada_with(&[], Arc::new(Selfish)).also_holds_raw("viewer", "self");
+    assert!(!ada.reads("KILN-1"));
 }
 
 // --- look-alikes ---------------------------------------------------------------
@@ -318,7 +418,6 @@ fn malformed_address_scopes_are_refused() {
 #[test]
 fn look_alike_addresses_cover_nothing_they_resemble() {
     assert!(!ada(&["operator on /dynamo"]).may("dyn.connect"));
-    assert!(!ada(&["operator on /dyn"]).may("dynamo.connect"));
     assert!(!ada(&["operator on /dyn.*"]).may("dynamo.connect"));
     assert!(!ada(&["operator on /dyn.peer.*"]).may("dyn.peerx.shop.list"));
     assert!(!ada(&["operator on /DYN"]).may("dyn.connect"));
@@ -330,11 +429,12 @@ fn a_malformed_address_held_raw_holds_nothing() {
     for raw in ["/dyn.", "//", "/*", "/dyn.*.x", "/", "/dyn@x", "/ dyn", "/dyn.connect "] {
         let ada = ada(&[]).also_holds_raw("admin", raw);
         assert!(!ada.may("dyn.connect"), "{raw:?}");
-        assert!(!ada.may_everywhere("dyn.connect"), "{raw:?}");
-        assert!(!ada.may_on("tickets.get", "KILN-1"), "{raw:?}");
+        assert!(!ada.reads("KILN-1"), "{raw:?}");
         assert!(!ada.holds_anywhere("tickets.list"), "{raw:?}");
     }
 }
+
+// --- the dispatcher's contract (review F5, F6) --------------------------------
 
 #[test]
 fn a_call_address_splits_only_at_its_method() {
@@ -346,103 +446,6 @@ fn a_call_address_splits_only_at_its_method() {
     let shop = CallAddress::new("dyn.peer.shop.items", "list").unwrap();
     assert_eq!((shop.activation(), shop.method(), shop.path()), ("dyn.peer.shop.items", "list", "dyn.peer.shop.items.list"));
 }
-
-// --- the gate owns addresses -------------------------------------------------
-
-#[test]
-fn a_resolver_cannot_put_an_address_in_a_chain() {
-    let ada = ada_with(&["operator on /ui.*", "operator on /dyn"], Arc::new(Forger));
-    assert!(!ada.may_on("tickets.get", "KILN-1"));
-    assert!(!ada.may_on("tickets.get", "/dyn"));
-    assert!(!ada.gate.check(Some(&ada.session), &Grant::new("tickets.get"), Some("/ui.*")).is_ok());
-}
-
-#[test]
-fn a_data_scope_beginning_with_a_slash_is_no_data_scope() {
-    // Held raw as if a service had named a data scope `/KILN`, and a
-    // resolver that answers it: it is an address, and covers no call here.
-    struct Slashed;
-    impl Resolve for Slashed {
-        fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-            Some(vec![ScopeRef::named(target), ScopeRef::named("/KILN"), ScopeRef::Everywhere])
-        }
-    }
-    let ada = ada_with(&[], Arc::new(Slashed)).also_holds_raw("viewer", "/KILN");
-    assert!(!ada.may_on("tickets.get", "KILN-1"));
-    assert!(!ada.may_on("tickets.get", "/KILN"));
-    assert!(!ada.holds_anywhere("tickets.list"));
-}
-
-#[test]
-fn told_no_address_the_gate_holds_an_address_scope_on_nothing() {
-    let ada = ada(&["admin on /dyn.*"]);
-    assert!(ada.gate.check(Some(&ada.session), &Grant::new("dyn.connect"), None).is_err());
-    assert!(ada.gate.check_everywhere(Some(&ada.session), &Grant::new("dyn.connect")).is_err());
-    assert!(ada.gate.reach_of_public(Some(&ada.session), &Grant::new("dyn.connect")).is_empty());
-    assert!(!ada.gate.reach_of_public_at(Some(&ada.session), &call("dyn.connect")).is_empty());
-}
-
-// --- the grant is tied to the address (review F1) ----------------------------
-
-#[test]
-fn an_operator_on_one_method_holds_no_other_grant_inside_that_call() {
-    let ada = ada(&["operator on /dyn.connect"]);
-    assert!(ada.may("dyn.connect"));
-    assert!(!ada.may_also("dyn.disconnect"));
-}
-
-#[test]
-fn an_admin_on_dyn_cannot_grant_roles_from_inside_connect() {
-    let ada = ada(&["admin on /dyn"]);
-    assert!(ada.may_everywhere("dyn.connect"));
-    assert!(!ada.may_also("auth.grant"));
-}
-
-#[test]
-fn a_reach_on_an_address_allows_only_its_own_grant() {
-    let ada = ada(&["operator on /dyn.*"]);
-    let reach = ada.reach("dyn.peer.shop.items.list").unwrap();
-    assert_eq!(reach.grant(), Some(&Grant::new("dyn.{peer}")));
-    assert!(reach.allows("KILN-1"));
-    assert!(!ada.may_also("dyn.{peer}"), "the same grant, asked outside the call, holds nothing");
-}
-
-// --- one spelling for the root (review F3) -----------------------------------
-
-#[test]
-fn self_stored_raw_holds_nothing_anywhere() {
-    for raw in [ScopeRef::parse("self"), serde_json::from_str::<ScopeRef>("\"self\"").unwrap()] {
-        assert_eq!(raw, ScopeRef::named("self"), "the lenient spelling is a name");
-        let ada = ada(&[]).also_holds_raw("admin", raw.as_str());
-        assert!(!ada.may("dyn.connect"));
-        assert!(!ada.may_everywhere("dyn.connect"));
-        assert!(!ada.may_on("tickets.get", "KILN-1"));
-        assert!(!ada.holds_anywhere("tickets.list"));
-        assert!(!ada.may_also("auth.grant"));
-    }
-}
-
-#[test]
-fn a_ceiling_of_self_stored_raw_allows_nothing() {
-    let ada = ada(&["admin on *"]).capped_to(&["admin@self"]);
-    assert!(!ada.may("dyn.connect"));
-    assert!(!ada.may_on("tickets.get", "KILN-1"));
-    assert!(!ada.holds_anywhere("tickets.list"));
-}
-
-#[test]
-fn a_resolver_cannot_name_self_in_a_chain() {
-    struct Selfish;
-    impl Resolve for Selfish {
-        fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
-            Some(vec![ScopeRef::named(target), ScopeRef::named("self")])
-        }
-    }
-    let ada = ada_with(&[], Arc::new(Selfish)).also_holds_raw("viewer", "self");
-    assert!(!ada.may_on("tickets.get", "KILN-1"));
-}
-
-// --- the dispatcher's contract (review F5, F6) --------------------------------
 
 #[test]
 fn a_key_holding_a_dot_is_never_one_segment() {
@@ -461,4 +464,39 @@ fn an_address_names_a_method_and_an_activation_alike() {
     assert!(connect.covers_address(&at("dyn.connect")));
     assert!(connect.covers_address(&at("dyn.connect.status")));
     assert!(!connect.covers_address(&at("dyn.connect.status.read")));
+}
+
+// --- the gate owns addresses -------------------------------------------------
+
+#[test]
+fn a_resolver_cannot_put_an_address_in_a_chain() {
+    let ada = ada_with(&["operator on /ui.*", "operator on /dyn"], Arc::new(Forger));
+    assert!(!ada.reads("KILN-1"));
+    assert!(!ada.reads("/dyn"));
+    assert!(!ada.reads("/ui.*"));
+}
+
+#[test]
+fn a_data_scope_beginning_with_a_slash_is_no_data_scope() {
+    // Held raw as if a service had named a data scope `/KILN`, and a
+    // resolver that answers it: it is an address, and holds no data.
+    struct Slashed;
+    impl Resolve for Slashed {
+        fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::named(target), ScopeRef::named("/KILN"), ScopeRef::Everywhere])
+        }
+    }
+    let ada = ada_with(&[], Arc::new(Slashed)).also_holds_raw("viewer", "/KILN");
+    assert!(!ada.reads("KILN-1"));
+    assert!(!ada.reads("/KILN"));
+    assert!(!ada.holds_anywhere("tickets.list"));
+}
+
+#[test]
+fn told_no_call_the_gate_holds_an_address_scope_on_nothing() {
+    let ada = ada(&["admin on /dyn.*"]);
+    assert!(ada.gate.check(Some(&ada.session), &Grant::new("dyn.connect"), None).is_err());
+    assert!(ada.gate.check_everywhere(Some(&ada.session), &Grant::new("dyn.connect")).is_err());
+    assert!(ada.gate.reach_of_public(Some(&ada.session), &Grant::new("dyn.connect")).is_empty());
+    assert!(ada.may("dyn.connect"));
 }
