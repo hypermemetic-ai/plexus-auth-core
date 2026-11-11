@@ -1114,6 +1114,9 @@ impl Default for GrantsGeneration {
     }
 }
 
+/// KEEL-59 (N2): see [`GrantsGeneration::on_move`].
+static ON_MOVE: std::sync::OnceLock<fn(u64)> = std::sync::OnceLock::new();
+
 impl GrantsGeneration {
     /// A count at 0.
     pub fn new() -> Self {
@@ -1124,8 +1127,22 @@ impl GrantsGeneration {
     /// subscriber woken. Answers the generation now.
     pub fn bump(&self) -> u64 {
         let n = self.now.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        // KEEL-59 (N2): told before any subscriber wakes, in the task that
+        // moved it, so the call that made the move knows it was its own.
+        if let Some(told) = ON_MOVE.get() {
+            told(n);
+        }
         self.tx.send_replace(n);
         n
+    }
+
+    /// KEEL-59 (N2): `told(generation)` is called, in the moving task, with
+    /// every generation a [`bump`](Self::bump) makes — before anything
+    /// subscribed to it wakes. Set once per process (plexus-core sets it,
+    /// so the call whose own write moved the grants is not ended by that
+    /// move); a later call is ignored.
+    pub fn on_move(told: fn(u64)) {
+        let _ = ON_MOVE.set(told);
     }
 
     /// [`bump`](Self::bump), naming what moved (for the reader; the count
