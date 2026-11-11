@@ -8,6 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-11-11
+
+ONE-6 (build 1 of ONE-4): a role can be held on an **address**. Additive and
+inert until a dispatcher tells the gate which call it is deciding
+(plexus-core, build 2); no existing public signature changes.
+
+**Activation scopes and data scopes are separate** (owner, 2026-11-11:
+"activation and data scopes are separate. we can only generally handle
+activation scopes. data scopes must be handled by the application"). An
+address scope answers one question — may this caller make this call at this
+address (the door) — and never stands for data.
+
+### Added
+
+- Two scope forms a membership or a ceiling entry may be held on:
+  `/dyn` — the methods of the activation `dyn`, or with `/dyn.connect` that
+  one method, and nothing mounted beneath; `/dyn.*` — `dyn` and everything
+  beneath it (`/dyn.peer.shop.*` is one peer). `/P` names a method `P` and an
+  activation mounted at `P` alike. `self` is `*`: the service being called,
+  never the caller.
+- `ScopeRef::parse_checked` (strict: segments of `A-Z a-z 0-9 _ -`, an
+  optional trailing `.*`, nothing else; `self` → `*`). Every scope being
+  written — a membership granted, a role or team grant stored, a ceiling
+  minted — goes through it. `ScopeRef::is_address`, `ScopeRef::covers_address`.
+- `CallAddress::new(activation, method)` and `CallAddress::of_segments(segments,
+  method)` — a call's literal address; the method one segment, and from
+  routed segments a key holding a dot is refused rather than split.
+- `DispatchedCall::new(address, grant)` — one dispatched call: its address and
+  the grant it dispatches to, paired once by the dispatcher.
+- `Gate::check_everywhere_at(caller, &call)` — the door, for the call's own
+  grant: admitted on `*`, the activation's address, the method's own, or a
+  `.*` above it, within every ceiling layer; never on a data scope (KEEL-31).
+  A refusal names `/<activation>`. Its reach's `held_on` is the caller's data
+  scopes for the grant (`[]` for one holding only addresses).
+- `Reach::holds_activation()` — the grant is held for the whole of the call's
+  activation: on `*`, or at the door. `Reach::is_everywhere()` keeps its
+  meaning: a real `*` only. A backstop on a whole-service method asks the
+  first; one that means "every data scope" asks the second.
+- Decided for the three shapes (crate docs, `grants`): an address scope
+  admits at the door (`everywhere` methods; calls into an untyped peer slot,
+  build 2) and counts for nothing in `check` — not for a target, not as "held
+  anywhere" for a targetless read, which is refused to a caller holding only
+  addresses.
+
+### Changed — behavior, even with no address passed
+
+- **A scope beginning with `/` is never a data scope.** A membership or
+  ceiling entry on one holds no data anywhere and opens only the door of a
+  dispatched call it covers; a `Resolve` chain that names one has it dropped (so a
+  target whose own scopes begin with `/` can be held only through `*`).
+  Why: the gate owns addresses — if a `/` name could still be a service's
+  data scope, a resolver (or a target value it echoes) could forge an
+  address into a chain, and one name would mean two things. A service whose
+  own data scopes began with `/` (paths, say) loses them in 0.3.4 and must
+  rename them; none is known.
+- **`self` is reserved.** A membership, ceiling entry or chain entry held as
+  the raw name `self` (through the lenient `ScopeRef::parse` or serde) holds
+  nothing — no longer a data scope that made a targetless read "held
+  anywhere". Why: `parse_checked` reads `self` as `*`; a raw `self` meaning
+  anything else would be a second, surprising meaning of one spelling.
+
 ## [0.3.3] — 2026-11-10
 
 - Performance (PERF.115-49), no decision changed: a principal is parsed once a

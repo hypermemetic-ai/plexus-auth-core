@@ -68,7 +68,7 @@
 //!   [`ScopeRef`], [`GrantSet`], [`Membership`], [`Ceiling`], the service
 //!   traits [`Memberships`] / [`Roles`] / [`Resolve`], and the [`Gate`] whose
 //!   [`Gate::check`] answers a call with a [`Reach`] or a [`Refusal`].
-//! - [`ScopeRegistry`] — hub-level roles→scopes source of truth (R-0,
+//! - [`ScopeRegistry`] — service-level roles→scopes source of truth (R-0,
 //!   reviving AUTHZ-CORE-4 + CORE-6). [`Role`]s are named scope-sets with
 //!   transitive, build-time-cycle-rejected inheritance; [`Scope`] gains the
 //!   grammar-validated `try_new` and segment-bounded wildcard
@@ -165,7 +165,7 @@ pub use forward::{
     PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
 };
 pub use grants::{
-    Ceiling, CeilingError, Fingerprint, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal,
+    AddressError, CallAddress, Ceiling, DispatchedCall, CeilingError, Fingerprint, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal,
     Resolve, RoleOrGrant, RoleTable, RoleTableError, Roles, ScopeRef, ADMIN, CEILING_KEY,
 };
 pub use oidc::{
