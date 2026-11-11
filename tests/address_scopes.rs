@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use plexus_auth_core::grants::{
-    CallAddress, Gate, Grant, Membership, Memberships, Reach, Refusal, Resolve, RoleTable, ScopeRef, CEILING_KEY,
+    CallAddress, DispatchedCall, Gate, Grant, Membership, Memberships, Reach, Refusal, Resolve, RoleTable, ScopeRef, CEILING_KEY,
 };
 use plexus_auth_core::identity::Principal;
 use plexus_auth_core::{AuthContext, RoleName};
@@ -37,6 +37,12 @@ fn grant_of(path: &str) -> Grant {
 fn at(path: &str) -> CallAddress {
     let (activation, method) = path.rsplit_once('.').unwrap();
     CallAddress::new(activation, method).unwrap()
+}
+
+/// The call to `path` as dispatch hands it to the gate: its address and
+/// its grant, paired once.
+fn call(path: &str) -> DispatchedCall {
+    DispatchedCall::new(at(path), grant_of(path))
 }
 
 /// Tickets `CODE-n` live in `CODE`; nothing else resolves.
@@ -108,7 +114,7 @@ impl Ada {
     }
 
     fn reach(&self, path: &str) -> Result<Reach, Refusal> {
-        self.gate.check_at(Some(&self.session), &grant_of(path), None, &at(path))
+        self.gate.check_at(Some(&self.session), &call(path), None)
     }
 
     /// May she make this call (no target)?
@@ -118,7 +124,7 @@ impl Ada {
 
     /// May she make this call on that target?
     fn may_on(&self, path: &str, target: &str) -> bool {
-        self.gate.check_at(Some(&self.session), &grant_of(path), Some(target), &at(path)).is_ok()
+        self.gate.check_at(Some(&self.session), &call(path), Some(target)).is_ok()
     }
 
     /// May she call this whole-service method?
@@ -127,7 +133,14 @@ impl Ada {
     }
 
     fn refused_everywhere(&self, path: &str) -> Option<Refusal> {
-        self.gate.check_everywhere_at(Some(&self.session), &grant_of(path), &at(path)).err()
+        self.gate.check_everywhere_at(Some(&self.session), &call(path)).err()
+    }
+
+    /// Inside a call, may she use another grant — a second check, a seam,
+    /// a store's sub-check, which is told no address?
+    fn may_also(&self, grant: &str) -> bool {
+        self.gate.check(Some(&self.session), &Grant::new(grant), None).is_ok()
+            || self.gate.check_everywhere(Some(&self.session), &Grant::new(grant)).is_ok()
     }
 
     /// Is the grant "held anywhere" by the gate's old, addressless word?
@@ -366,5 +379,86 @@ fn told_no_address_the_gate_holds_an_address_scope_on_nothing() {
     assert!(ada.gate.check(Some(&ada.session), &Grant::new("dyn.connect"), None).is_err());
     assert!(ada.gate.check_everywhere(Some(&ada.session), &Grant::new("dyn.connect")).is_err());
     assert!(ada.gate.reach_of_public(Some(&ada.session), &Grant::new("dyn.connect")).is_empty());
-    assert!(!ada.gate.reach_of_public_at(Some(&ada.session), &Grant::new("dyn.connect"), &at("dyn.connect")).is_empty());
+    assert!(!ada.gate.reach_of_public_at(Some(&ada.session), &call("dyn.connect")).is_empty());
+}
+
+// --- the grant is tied to the address (review F1) ----------------------------
+
+#[test]
+fn an_operator_on_one_method_holds_no_other_grant_inside_that_call() {
+    let ada = ada(&["operator on /dyn.connect"]);
+    assert!(ada.may("dyn.connect"));
+    assert!(!ada.may_also("dyn.disconnect"));
+}
+
+#[test]
+fn an_admin_on_dyn_cannot_grant_roles_from_inside_connect() {
+    let ada = ada(&["admin on /dyn"]);
+    assert!(ada.may_everywhere("dyn.connect"));
+    assert!(!ada.may_also("auth.grant"));
+}
+
+#[test]
+fn a_reach_on_an_address_allows_only_its_own_grant() {
+    let ada = ada(&["operator on /dyn.*"]);
+    let reach = ada.reach("dyn.peer.shop.items.list").unwrap();
+    assert_eq!(reach.grant(), Some(&Grant::new("dyn.{peer}")));
+    assert!(reach.allows("KILN-1"));
+    assert!(!ada.may_also("dyn.{peer}"), "the same grant, asked outside the call, holds nothing");
+}
+
+// --- one spelling for the root (review F3) -----------------------------------
+
+#[test]
+fn self_stored_raw_holds_nothing_anywhere() {
+    for raw in [ScopeRef::parse("self"), serde_json::from_str::<ScopeRef>("\"self\"").unwrap()] {
+        assert_eq!(raw, ScopeRef::named("self"), "the lenient spelling is a name");
+        let ada = ada(&[]).also_holds_raw("admin", raw.as_str());
+        assert!(!ada.may("dyn.connect"));
+        assert!(!ada.may_everywhere("dyn.connect"));
+        assert!(!ada.may_on("tickets.get", "KILN-1"));
+        assert!(!ada.holds_anywhere("tickets.list"));
+        assert!(!ada.may_also("auth.grant"));
+    }
+}
+
+#[test]
+fn a_ceiling_of_self_stored_raw_allows_nothing() {
+    let ada = ada(&["admin on *"]).capped_to(&["admin@self"]);
+    assert!(!ada.may("dyn.connect"));
+    assert!(!ada.may_on("tickets.get", "KILN-1"));
+    assert!(!ada.holds_anywhere("tickets.list"));
+}
+
+#[test]
+fn a_resolver_cannot_name_self_in_a_chain() {
+    struct Selfish;
+    impl Resolve for Selfish {
+        fn chain(&self, target: &str) -> Option<Vec<ScopeRef>> {
+            Some(vec![ScopeRef::named(target), ScopeRef::named("self")])
+        }
+    }
+    let ada = ada_with(&[], Arc::new(Selfish)).also_holds_raw("viewer", "self");
+    assert!(!ada.may_on("tickets.get", "KILN-1"));
+}
+
+// --- the dispatcher's contract (review F5, F6) --------------------------------
+
+#[test]
+fn a_key_holding_a_dot_is_never_one_segment() {
+    assert!(CallAddress::new("dyn.peer.github.repos.alice", "app.v2").is_err());
+    assert!(CallAddress::of_segments(&["dyn", "peer", "github", "repos", "alice", "app.v2"], "issues").is_err());
+    assert!(CallAddress::of_segments(&[], "list").is_err());
+    let routed = CallAddress::of_segments(&["dyn", "peer", "github", "repos", "alice", "app"], "issues").unwrap();
+    assert_eq!(routed, CallAddress::new("dyn.peer.github.repos.alice.app", "issues").unwrap());
+    // Joined by hand, a dotted key cannot be told from two segments: hence `of_segments`.
+    assert!(CallAddress::new("dyn.peer.github.repos.alice.app.v2", "issues").is_ok());
+}
+
+#[test]
+fn an_address_names_a_method_and_an_activation_alike() {
+    let connect = ScopeRef::parse_checked("/dyn.connect").unwrap();
+    assert!(connect.covers_address(&at("dyn.connect")));
+    assert!(connect.covers_address(&at("dyn.connect.status")));
+    assert!(!connect.covers_address(&at("dyn.connect.status.read")));
 }

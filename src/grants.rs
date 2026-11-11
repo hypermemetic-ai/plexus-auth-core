@@ -24,12 +24,16 @@
 //! - ONE-6: a membership may also be held on an **address** — `/dyn` (the
 //!   methods of the activation `dyn`, or with `/dyn.connect` one method) or
 //!   `/dyn.*` (`dyn` and everything mounted beneath it). The gate owns
-//!   addresses: it is told the call's literal address ([`CallAddress`],
-//!   through [`Gate::check_at`] and [`Gate::check_everywhere_at`]) and
+//!   addresses: it is told the call it decides — its literal address and
+//!   its grant as one [`DispatchedCall`], through [`Gate::check_at`] and
+//!   [`Gate::check_everywhere_at`] — and
 //!   never asks a [`Resolve`] about one. An address scope holds a grant
-//!   only inside a call it covers, and there it stands as `*`; told no
-//!   address, the gate holds it on nothing. `self` is `*`: the service
-//!   being called.
+//!   only inside a call it covers, only for that call's own grant, and
+//!   there it stands as `*`; told no call, the gate holds it on nothing.
+//!   `self` is `*`: the service being called. Since 0.3.4 a scope that
+//!   begins with `/` is never a data scope, and a raw `self` holds nothing
+//!   (see [`ScopeRef`]); a scope being written goes through
+//!   [`ScopeRef::parse_checked`].
 //!
 //! [`Gate::check`] answers one call: allowed — with the [`Reach`] the method
 //! answers from — or a [`Refusal`] that names what was needed. Everything is
@@ -107,10 +111,24 @@ impl fmt::Display for Grant {
 /// What a name means — a shortcode, a tenant, a project — is the service's;
 /// the gate only compares names and asks [`Resolve::chain`] how they nest.
 ///
-/// ONE-6: a name that begins with `/` is not the service's: it is an
-/// address scope (`/dyn`, `/dyn.*`, [`ScopeRef::parse_checked`]), which the
-/// gate decides by the call's address alone ([`CallAddress`]). It is never
-/// a data scope, and a [`Resolve`] chain that names one has it dropped.
+/// ONE-6: two kinds of name are not the service's.
+///
+/// - A name that begins with `/` is an address scope (`/dyn`, `/dyn.*`,
+///   [`ScopeRef::parse_checked`]), which the gate decides by the call's
+///   address alone ([`CallAddress`], [`DispatchedCall`]). It is never a data
+///   scope: a service whose own data scopes began with `/` loses them (as of
+///   0.3.4), and a [`Resolve`] chain that names one has it dropped.
+/// - The name `self` is reserved: written through
+///   [`ScopeRef::parse_checked`] it is `*`; held as a raw `Named("self")`
+///   (stored through the lenient [`ScopeRef::parse`] or serde) it holds
+///   nothing at all — never a data scope, never `*`. A [`Resolve`] chain that
+///   names it has it dropped too.
+///
+/// Inside a call it covers, an address scope stands as `*`: over every data
+/// scope as well (`viewer on /tickets.*` may read any organization's
+/// tickets). Whether it should instead not count for a call that names a
+/// data target is the owner's question (ONE-6 review, F2); the rule lives in
+/// one function, `Gate::stands`.
 ///
 /// On the wire, a plain string: `"*"` or the name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -123,6 +141,13 @@ pub enum ScopeRef {
 
 impl ScopeRef {
     /// `"*"` → [`ScopeRef::Everywhere`]; anything else (trimmed) → named.
+    ///
+    /// Lenient, as the wire is: it refuses nothing and reads `self` as a
+    /// name, which the gate then holds on nothing. **A scope being written —
+    /// a membership granted (`auth.grant`, `members.grant`), a role or a
+    /// team's grant stored, a ceiling minted into a session — must go
+    /// through [`ScopeRef::parse_checked`]**, which reads `self` as `*` and
+    /// refuses a malformed address, so neither is stored to mean nothing.
     pub fn parse(text: &str) -> Self {
         match text.trim() {
             "*" => Self::Everywhere,
@@ -184,6 +209,12 @@ impl ScopeRef {
     /// Well formed or not: one that is not covers nothing.
     pub fn is_address(&self) -> bool {
         matches!(self, Self::Named(n) if n.starts_with('/'))
+    }
+
+    /// A service's own name: neither `*`, nor an address, nor the reserved
+    /// `self`.
+    fn is_data(&self) -> bool {
+        matches!(self, Self::Named(n) if !n.starts_with('/') && n != "self")
     }
 
     /// ONE-6: whether this scope covers the call at `at` *as an address*:
@@ -265,6 +296,24 @@ fn address_form(scope: &str) -> Option<(&str, bool)> {
 /// So `operator on /dyn` reaches `dyn.connect` and not
 /// `dyn.peer.shop.items.list`; `operator on /dyn.*` reaches both;
 /// `operator on /dyn.peer.shop.*` reaches the peer `shop` alone.
+///
+/// **`/P` names a method and an activation alike.** `/dyn.connect` covers
+/// the method `dyn.connect` *and* every method of an activation mounted at
+/// `dyn.connect`, should one exist. An address cannot tell them apart; a
+/// service that mounts a child under a method's name gives both to whoever
+/// holds `/P`.
+///
+/// **The contract a dispatcher relies on.** What is refused here: an empty
+/// segment, a method holding a dot, and any byte outside `A–Z a–z 0–9 _ -`
+/// (so `*`, `@`, `{`, `/`, a space, non-ASCII). What cannot be refused
+/// here: a key that holds a dot, joined into the activation's path
+/// (`dyn.peer.github.repos.alice.app.v2.issues`) — it reads as two
+/// segments, and `/…alice.app.*` would cover the repository `app.v2`. A
+/// dispatcher builds the address from its routed segments with
+/// [`CallAddress::of_segments`], which refuses a segment holding a dot,
+/// and never joins or splits a key itself. An address that cannot be built
+/// is no address: the call is decided as told none, where an address scope
+/// holds nothing — never on a shorter address that would parse.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallAddress {
     /// `activation.method`.
@@ -288,6 +337,18 @@ impl CallAddress {
         Ok(Self { path: format!("{activation}.{method}"), dot: activation.len() })
     }
 
+    /// The call of `method` on the activation whose path is `activation`,
+    /// segment by segment as routed (`["dyn", "peer", "shop", "items"]`,
+    /// `"list"`). Each is one segment: one holding a dot (a key `app.v2`)
+    /// is refused, never split.
+    pub fn of_segments(activation: &[&str], method: &str) -> Result<Self, AddressError> {
+        match activation.iter().find(|s| !segment_ok(s)) {
+            Some(bad) => Err(AddressError(format!("`{bad}` is not one segment of an address"))),
+            None if activation.is_empty() => Err(AddressError("an activation's address has a segment".into())),
+            None => Self::new(&activation.join("."), method),
+        }
+    }
+
     /// The activation's address: `dyn`, `dyn.peer.shop.items`.
     pub fn activation(&self) -> &str {
         &self.path[..self.dot]
@@ -307,6 +368,47 @@ impl CallAddress {
 impl fmt::Display for CallAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.path)
+    }
+}
+
+/// ONE-6: one call as dispatched — its literal address and the grant that
+/// address dispatches to, as one value. The address-aware checks
+/// ([`Gate::check_at`], [`Gate::check_everywhere_at`],
+/// [`Gate::reach_of_public_at`]) take this and nothing else, and decide its
+/// grant: an address scope covering the address admits that grant only.
+///
+/// The dispatcher builds it **once, at dispatch, from the routed entry**:
+/// the address from the path it routed, the grant from the same entry (the
+/// method's own, a schema-named one, or a slot's such as `dyn.{peer}`). The
+/// gate never compares the two as strings — a grant's name may differ from
+/// its path.
+///
+/// **A check inside a call** — a method's own `required(…)`, a seam asking
+/// the gate, a store's per-aspect check, any second grant — is asked with
+/// [`Gate::check`] / [`Gate::check_everywhere`], told no address: an address
+/// scope holds nothing there. Only the reach the dispatched call was given
+/// carries its address, and only for its own grant ([`Reach::allows`],
+/// [`Reach::current`] re-ask with both).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DispatchedCall {
+    at: CallAddress,
+    grant: Grant,
+}
+
+impl DispatchedCall {
+    /// The call at `at`, which dispatches to `grant`.
+    pub fn new(at: CallAddress, grant: Grant) -> Self {
+        Self { at, grant }
+    }
+
+    /// Its address.
+    pub fn at(&self) -> &CallAddress {
+        &self.at
+    }
+
+    /// The grant its address dispatches to.
+    pub fn grant(&self) -> &Grant {
+        &self.grant
     }
 }
 
@@ -754,9 +856,9 @@ struct Live {
     /// again by [`Gate::check_everywhere`], so it lasts only while the grant
     /// is held on `*`.
     everywhere: bool,
-    /// ONE-6: the call's address, when the gate was told it — asked again
-    /// at the same address.
-    at: Option<CallAddress>,
+    /// ONE-6: the dispatched call it was decided in, when it was — asked
+    /// again in the same call.
+    call: Option<DispatchedCall>,
 }
 
 impl Live {
@@ -769,8 +871,8 @@ impl Live {
     /// it, as it always has).
     fn now_on(&self, target: Option<&str>) -> Result<Reach, Refusal> {
         match self.everywhere {
-            true => self.gate.everywhere_in(self.caller.as_ref(), &self.grant, self.at.as_ref()),
-            false => self.gate.check_in(self.caller.as_ref(), &self.grant, target, self.at.as_ref()),
+            true => self.gate.everywhere_in(self.caller.as_ref(), &self.grant, self.call.as_ref()),
+            false => self.gate.check_in(self.caller.as_ref(), &self.grant, target, self.call.as_ref()),
         }
     }
 }
@@ -1122,52 +1224,91 @@ impl Gate {
     }
 
     /// ONE-6: what the service's [`Resolve`] says of `name`, with every
-    /// address scope dropped. The gate owns addresses: a resolver's answer
-    /// can never put one in a chain. Dropping only narrows — the chain
-    /// loses a scope and gains none — and a chain is otherwise read as
-    /// before, so a caller holding `*` is answered as it always was even
-    /// when the target's own value begins with `/` (a resolver that echoes
-    /// its target, as plexus-login's does).
+    /// scope that is not the service's own dropped — an address, or the
+    /// reserved `self`. The gate owns addresses: a resolver's answer can
+    /// never put one in a chain. Dropping only narrows — the chain loses a
+    /// scope and gains none — and a chain is otherwise read as before, so a
+    /// caller holding `*` is answered as it always was even when the
+    /// target's own value begins with `/` (a resolver that echoes its
+    /// target, as plexus-login's does).
     fn chain_of(&self, name: &str) -> Option<Vec<ScopeRef>> {
         let mut chain = self.inner.resolve.chain(name)?;
-        chain.retain(|s| !s.is_address());
+        chain.retain(|s| s.is_everywhere() || s.is_data());
         Some(chain)
     }
 
-    /// ONE-6: what a held scope (a membership's, a ceiling entry's) stands
-    /// for in the call at `at`: `*` stays `*`; an address scope is `*`
-    /// inside a call it covers and nothing anywhere else — nothing at all
-    /// when the gate was not told the call's address; a data scope is
-    /// itself.
-    fn place(scope: &ScopeRef, at: Option<&CallAddress>) -> Option<ScopeRef> {
+    /// ONE-6 (F1): the address an address scope may be placed by, in a
+    /// check of `grant` — the dispatched call's, and only when `grant` is
+    /// the grant that call dispatches to. Any other grant is asked as if no
+    /// address were told. The pair is compared whole, as the dispatcher
+    /// built it; never a grant's name against a path.
+    fn address_for<'c>(call: Option<&'c DispatchedCall>, grant: &Grant) -> Option<&'c CallAddress> {
+        call.filter(|c| c.grant() == grant).map(DispatchedCall::at)
+    }
+
+    /// **ONE-6: the rule, in one place** — what one held scope (a
+    /// membership's, a ceiling entry's) stands for in one check of a call
+    /// at `at` (already [`Gate::address_for`]'s answer), which names a data
+    /// target or not (`targeted`):
+    ///
+    /// - `*` stands for `*`;
+    /// - an address scope stands for `*` inside a call it covers, and for
+    ///   nothing elsewhere — nothing at all when no address is told;
+    /// - the reserved `self`, held raw, stands for nothing;
+    /// - a data scope stands for itself.
+    ///
+    /// `targeted` is not read today: an address scope stands as `*` over
+    /// every data target too (ONE-6 review F2, the owner's to decide). To
+    /// make it "an address scope does not count for a call that declares a
+    /// data target", the address arm becomes
+    /// `Some(a) if !targeted && scope.covers_address(a)`.
+    fn stands(scope: &ScopeRef, at: Option<&CallAddress>, targeted: bool) -> Stands {
+        let _ = targeted;
         match scope {
-            ScopeRef::Everywhere => Some(ScopeRef::Everywhere),
-            s if s.is_address() => at.filter(|a| s.covers_address(a)).map(|_| ScopeRef::Everywhere),
-            s => Some(s.clone()),
+            ScopeRef::Everywhere => Stands::Everywhere,
+            s if s.is_address() => match at {
+                Some(a) if s.covers_address(a) => Stands::Everywhere,
+                _ => Stands::Nothing,
+            },
+            s if s.is_data() => Stands::Itself,
+            _ => Stands::Nothing,
         }
     }
 
-    /// [`Gate::place`], asked only whether the placed scope is in `chain`
-    /// (or is `*`) — without building it.
+    /// [`Gate::stands`], as the scope it stands for (`None`: nothing).
+    fn place(scope: &ScopeRef, at: Option<&CallAddress>, targeted: bool) -> Option<ScopeRef> {
+        match Self::stands(scope, at, targeted) {
+            Stands::Everywhere => Some(ScopeRef::Everywhere),
+            Stands::Itself => Some(scope.clone()),
+            Stands::Nothing => None,
+        }
+    }
+
+    /// [`Gate::stands`], asked only whether what it stands for is `*` or in
+    /// `chain` — without building it.
     fn placed_in(scope: &ScopeRef, at: Option<&CallAddress>, chain: &[ScopeRef]) -> bool {
-        match scope {
-            ScopeRef::Everywhere => true,
-            s if s.is_address() => at.is_some_and(|a| s.covers_address(a)),
-            s => chain.contains(s),
+        match Self::stands(scope, at, true) {
+            Stands::Everywhere => true,
+            Stands::Itself => chain.contains(scope),
+            Stands::Nothing => false,
         }
     }
 
     /// Whether `inner` lies within `outer` (or is it). Both are placed
-    /// scopes (no address scope reaches here); one that is an address is
-    /// within nothing but itself.
+    /// scopes (`*` or data); anything else is within nothing.
     fn within(&self, inner: &ScopeRef, outer: &ScopeRef) -> bool {
-        if outer.is_everywhere() || inner == outer {
+        if outer.is_everywhere() {
+            return true;
+        }
+        if !inner.is_data() || !outer.is_data() {
+            return false;
+        }
+        if inner == outer {
             return true;
         }
         match inner {
-            ScopeRef::Everywhere => false,
-            s if s.is_address() || outer.is_address() => false,
             ScopeRef::Named(name) => self.chain_of(name).is_some_and(|c| c.contains(outer)),
+            ScopeRef::Everywhere => false,
         }
     }
 
@@ -1209,32 +1350,37 @@ impl Gate {
         layers: &[Ceiling],
         grant: &Grant,
         at: Option<&CallAddress>,
+        targeted: bool,
     ) -> Vec<ScopeRef> {
         let held = self.inner.memberships.held(principal);
-        self.held_on_in(held.iter().map(|m| (&m.role, &m.scope)), layers, grant, at)
+        self.held_on_in(held.iter().map(|m| (&m.role, &m.scope)), layers, grant, at, targeted)
     }
 
-    /// Where `held` (role, scope pairs) holds `grant` within `layers`, in
-    /// the call at `at` ([`Gate::place`]: an address scope is `*` inside a
-    /// call it covers and nothing elsewhere): what [`Gate::held_on`]
-    /// answers from the memberships and [`Gate::held_on_by`] from a
-    /// [`Fingerprint`] — one rule.
+    /// Where `held` (role, scope pairs) holds `grant` within `layers`, each
+    /// scope as it stands in the call ([`Gate::stands`]): what
+    /// [`Gate::held_on`] answers from the memberships and
+    /// [`Gate::held_on_by`] from a [`Fingerprint`] — one rule.
     fn held_on_in<'a>(
         &self,
         held: impl Iterator<Item = (&'a RoleName, &'a ScopeRef)>,
         layers: &[Ceiling],
         grant: &Grant,
         at: Option<&CallAddress>,
+        targeted: bool,
     ) -> Vec<ScopeRef> {
         let mut acc = Self::normal(
-            held.filter(|(role, _)| self.lists(role, grant)).filter_map(|(_, scope)| Self::place(scope, at)),
+            held.filter(|(role, _)| self.lists(role, grant)).filter_map(|(_, scope)| Self::place(scope, at, targeted)),
         );
         for layer in layers {
             if acc.is_empty() {
                 break;
             }
             let allowed = Self::normal(
-                layer.0.iter().filter(|(rg, _)| self.entry_allows(rg, grant)).filter_map(|(_, s)| Self::place(s, at)),
+                layer
+                    .0
+                    .iter()
+                    .filter(|(rg, _)| self.entry_allows(rg, grant))
+                    .filter_map(|(_, s)| Self::place(s, at, targeted)),
             );
             acc = self.meet(acc, allowed);
         }
@@ -1243,11 +1389,11 @@ impl Gate {
 
     /// Where the caller holds `grant`, within its ceiling: `[*]` when
     /// everywhere, `[]` when nowhere (and for an anonymous caller). What a
-    /// method without a target answers from. ONE-6: told no call's address,
-    /// an address scope holds nothing here.
+    /// method without a target answers from. ONE-6: told no call, an
+    /// address scope holds nothing here.
     pub fn held_on(&self, caller: &AuthContext, grant: &Grant) -> Vec<ScopeRef> {
         match Self::caller_of(Some(caller)) {
-            Some((p, layers)) => self.held_on_for(&p, &layers, grant, None),
+            Some((p, layers)) => self.held_on_for(&p, &layers, grant, None, false),
             None => Vec::new(),
         }
     }
@@ -1270,7 +1416,7 @@ impl Gate {
     /// built from it is exactly the one built from any caller it was taken
     /// of.
     pub fn held_on_by(&self, who: &Fingerprint, grant: &Grant) -> Vec<ScopeRef> {
-        self.held_on_in(who.held.iter().map(|(r, s)| (r, s)), &who.layers, grant, None)
+        self.held_on_in(who.held.iter().map(|(r, s)| (r, s)), &who.layers, grant, None, false)
     }
 
     /// Allowed when the grant is listed by a role held on a scope in the
@@ -1282,38 +1428,39 @@ impl Gate {
     /// ([`Gate::alive`]) — a signed-out session holds nothing, so a socket
     /// that signed out cannot go on to call `auth.grant`.
     ///
-    /// ONE-6: told no call's address, a role held on an address scope
-    /// holds nothing here — [`Gate::check_at`] is the check that knows
-    /// where the call is.
+    /// ONE-6: told no call, a role held on an address scope holds nothing
+    /// here — [`Gate::check_at`] is the check of a dispatched call. This is
+    /// also the check *inside* a call (a second grant, a seam, a store's
+    /// sub-check), which address scopes never reach ([`DispatchedCall`]).
     pub fn check(&self, caller: Option<&AuthContext>, grant: &Grant, target: Option<&str>) -> Result<Reach, Refusal> {
         self.check_in(caller, grant, target, None)
     }
 
-    /// ONE-6: [`Gate::check`] for the call at `at`, its literal address as
-    /// dispatched. A role held on an address scope counts only inside a
-    /// call that scope covers ([`CallAddress`] has the forms), and there it
-    /// stands as `*`: it admits any target, a read without one answers
-    /// from `[*]` ([`Reach::is_everywhere`]), and a ceiling entry on it
-    /// allows the same. Outside the calls it covers it holds nothing — not
-    /// "held anywhere" for a read with no target. Every other scope is
-    /// decided as [`Gate::check`] decides it. The reach is live at `at`.
+    /// ONE-6: [`Gate::check`] of the dispatched `call`, for its own grant.
+    /// A role held on an address scope counts only inside a call that
+    /// scope covers ([`CallAddress`] has the forms), and only for the grant
+    /// that call dispatches to; there it stands as `*`: it admits any
+    /// target, a read without one answers from `[*]`
+    /// ([`Reach::is_everywhere`]), and a ceiling entry on it allows the
+    /// same. Outside the calls it covers it holds nothing — not "held
+    /// anywhere" for a read with no target. Every other scope is decided as
+    /// [`Gate::check`] decides it. The reach is live for the same call.
     pub fn check_at(
         &self,
         caller: Option<&AuthContext>,
-        grant: &Grant,
+        call: &DispatchedCall,
         target: Option<&str>,
-        at: &CallAddress,
     ) -> Result<Reach, Refusal> {
-        self.check_in(caller, grant, target, Some(at))
+        self.check_in(caller, call.grant(), target, Some(call))
     }
 
-    /// The check, at an address or at none.
+    /// The check of `grant`, in a dispatched call or in none.
     fn check_in(
         &self,
         caller: Option<&AuthContext>,
         grant: &Grant,
         target: Option<&str>,
-        at: Option<&CallAddress>,
+        call: Option<&DispatchedCall>,
     ) -> Result<Reach, Refusal> {
         let Some((principal, layers)) = Self::caller_of(caller) else {
             return Err(Refusal::Unauthenticated);
@@ -1321,7 +1468,8 @@ impl Gate {
         if let Some(ctx) = caller {
             self.alive_named(ctx).map_err(|reason| Refusal::Ended { reason })?;
         }
-        let held_on = self.held_on_for(&principal, &layers, grant, at);
+        let at = Self::address_for(call, grant);
+        let held_on = self.held_on_for(&principal, &layers, grant, at, target.is_some());
         let (allowed, scope) = match target {
             None => (!held_on.is_empty(), ScopeRef::Everywhere),
             Some(t) => match self.chain_of(t) {
@@ -1343,19 +1491,16 @@ impl Gate {
             },
         };
         if allowed {
-            Ok(Reach {
-                held_on: held_on.into(),
-                live: Some(Live {
-                    gate: self.clone(),
-                    caller: caller.cloned(),
-                    grant: grant.clone(),
-                    everywhere: false,
-                    at: at.cloned(),
-                }),
-            })
+            Ok(Reach { held_on: held_on.into(), live: Some(self.live(caller, grant, call, false)) })
         } else {
             Err(Refusal::MissingGrant { grant: grant.clone(), scope, roles: self.roles_listing(grant), held_on })
         }
+    }
+
+    /// The live part of a reach: this gate, the caller, the grant, and the
+    /// dispatched call it was decided in (if any), asked again by `rule`.
+    fn live(&self, caller: Option<&AuthContext>, grant: &Grant, call: Option<&DispatchedCall>, everywhere: bool) -> Live {
+        Live { gate: self.clone(), caller: caller.cloned(), grant: grant.clone(), everywhere, call: call.cloned() }
     }
 
     /// KEEL-31: the check for a method that acts on the whole service (it
@@ -1369,38 +1514,34 @@ impl Gate {
         self.everywhere_in(caller, grant, None)
     }
 
-    /// ONE-6: [`Gate::check_everywhere`] for the whole-service method at
-    /// `at`. Its target is its own activation, so it is admitted where its
-    /// grant is held — through a role that lists it, within every ceiling
-    /// layer — on `*` (`self`), on the activation's address (`/dyn` for
-    /// `dyn.connect`), on the method's own (`/dyn.connect`), or on a
-    /// subtree above it (`/dyn.*`). A data scope never counts (KEEL-31),
-    /// nor an address that does not cover the call (`/ui`,
-    /// `/dyn.peer.shop.*`). A refusal names the activation's address. The
-    /// reach is `[*]` and stays live by this same rule, at `at`.
-    pub fn check_everywhere_at(
-        &self,
-        caller: Option<&AuthContext>,
-        grant: &Grant,
-        at: &CallAddress,
-    ) -> Result<Reach, Refusal> {
-        self.everywhere_in(caller, grant, Some(at))
+    /// ONE-6: [`Gate::check_everywhere`] of the dispatched whole-service
+    /// `call`, for its own grant. Its target is its own activation, so it
+    /// is admitted where its grant is held — through a role that lists it,
+    /// within every ceiling layer — on `*` (`self`), on the activation's
+    /// address (`/dyn` for `dyn.connect`), on the method's own
+    /// (`/dyn.connect`), or on a subtree above it (`/dyn.*`). A data scope
+    /// never counts (KEEL-31), nor an address that does not cover the call
+    /// (`/ui`, `/dyn.peer.shop.*`). A refusal names the activation's
+    /// address. The reach is `[*]` and stays live by this same rule, for
+    /// the same call.
+    pub fn check_everywhere_at(&self, caller: Option<&AuthContext>, call: &DispatchedCall) -> Result<Reach, Refusal> {
+        self.everywhere_in(caller, call.grant(), Some(call))
     }
 
-    /// The whole-service check, at an address or at none. Placed at `at`,
-    /// an address scope covering the call is `*` and every other is
-    /// nothing, so "held on `*`" is exactly the rule above.
+    /// The whole-service check of `grant`, in a dispatched call or in none.
+    /// Placed in the call, an address scope covering it is `*` and every
+    /// other is nothing, so "held on `*`" is exactly the rule above.
     fn everywhere_in(
         &self,
         caller: Option<&AuthContext>,
         grant: &Grant,
-        at: Option<&CallAddress>,
+        call: Option<&DispatchedCall>,
     ) -> Result<Reach, Refusal> {
-        let needed = || match at {
+        let needed = || match Self::address_for(call, grant) {
             Some(a) => ScopeRef::named(format!("/{}", a.activation())),
             None => ScopeRef::Everywhere,
         };
-        let reach = match self.check_in(caller, grant, None, at) {
+        let reach = match self.check_in(caller, grant, None, call) {
             Ok(reach) => reach,
             Err(Refusal::MissingGrant { grant, roles, held_on, .. }) => {
                 return Err(Refusal::MissingGrant { grant, scope: needed(), roles, held_on })
@@ -1428,24 +1569,29 @@ impl Gate {
         self.public_in(caller, grant, None)
     }
 
-    /// ONE-6: [`Gate::reach_of_public`] for the call at `at`: an address
-    /// scope counts inside a call it covers, as in [`Gate::check_at`].
-    pub fn reach_of_public_at(&self, caller: Option<&AuthContext>, grant: &Grant, at: &CallAddress) -> Reach {
-        self.public_in(caller, grant, Some(at))
+    /// ONE-6: [`Gate::reach_of_public`] of the dispatched `call`, for its
+    /// own grant: an address scope counts inside a call it covers, as in
+    /// [`Gate::check_at`].
+    pub fn reach_of_public_at(&self, caller: Option<&AuthContext>, call: &DispatchedCall) -> Reach {
+        self.public_in(caller, call.grant(), Some(call))
     }
 
-    fn public_in(&self, caller: Option<&AuthContext>, grant: &Grant, at: Option<&CallAddress>) -> Reach {
-        self.check_in(caller, grant, None, at).unwrap_or_else(|_| Reach {
+    fn public_in(&self, caller: Option<&AuthContext>, grant: &Grant, call: Option<&DispatchedCall>) -> Reach {
+        self.check_in(caller, grant, None, call).unwrap_or_else(|_| Reach {
             held_on: std::borrow::Cow::Borrowed(&[]),
-            live: Some(Live {
-                gate: self.clone(),
-                caller: caller.cloned(),
-                grant: grant.clone(),
-                everywhere: false,
-                at: at.cloned(),
-            }),
+            live: Some(self.live(caller, grant, call, false)),
         })
     }
+}
+
+/// What one held scope stands for in one check ([`Gate::stands`]).
+enum Stands {
+    /// `*`.
+    Everywhere,
+    /// The data scope itself.
+    Itself,
+    /// Nothing: it holds no grant here.
+    Nothing,
 }
 
 // ---------------------------------------------------------------------------
@@ -1798,5 +1944,20 @@ mod tests {
         assert!(reach.current().is_none());
         assert!(reach.recheck().is_err());
         assert!(!reach.allows("MENGER-1"));
+    }
+
+    /// ONE-6 (review F1): inside the gate too, a dispatched call places an
+    /// address scope only for the grant it dispatches to — any other grant
+    /// checked "in" it is decided as told no address.
+    #[test]
+    fn a_dispatched_call_places_addresses_for_its_own_grant_only() {
+        let m = Arc::new(Members::default());
+        m.grant(ADA, "admin", "/dyn.connect");
+        let gate = gate(&m);
+        let connect = DispatchedCall::new(CallAddress::new("dyn", "connect").unwrap(), g("dyn.connect"));
+        assert!(gate.check_in(Some(&who(ADA)), &g("dyn.connect"), None, Some(&connect)).is_ok());
+        assert!(gate.check_in(Some(&who(ADA)), &g("dyn.disconnect"), None, Some(&connect)).is_err());
+        assert!(gate.check_in(Some(&who(ADA)), &g("tickets.get"), Some("MENGER-1"), Some(&connect)).is_err());
+        assert!(gate.everywhere_in(Some(&who(ADA)), &g("auth.grant"), Some(&connect)).is_err());
     }
 }

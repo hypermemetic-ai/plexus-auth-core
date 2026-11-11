@@ -165,7 +165,7 @@ pub use forward::{
     PassThrough, ANONYMOUS_NAME, IDENTITY_ONLY_NAME, PASS_THROUGH_NAME,
 };
 pub use grants::{
-    AddressError, CallAddress, Ceiling, CeilingError, Fingerprint, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal,
+    AddressError, CallAddress, Ceiling, DispatchedCall, CeilingError, Fingerprint, Gate, Grant, GrantSet, Membership, Memberships, Reach, Refusal,
     Resolve, RoleOrGrant, RoleTable, RoleTableError, Roles, ScopeRef, ADMIN, CEILING_KEY,
 };
 pub use oidc::{

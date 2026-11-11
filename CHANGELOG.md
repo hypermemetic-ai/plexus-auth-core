@@ -11,35 +11,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.4] — 2026-11-11
 
 ONE-6 (build 1 of ONE-4): a role can be held on an **address**. Additive and
-inert until a dispatcher tells the gate where a call is (plexus-core, build 2);
-no public signature changes.
+inert until a dispatcher tells the gate which call it is deciding
+(plexus-core, build 2); no existing public signature changes.
 
 ### Added
 
 - Two scope forms a membership or a ceiling entry may be held on:
   `/dyn` — the methods of the activation `dyn`, or with `/dyn.connect` that
   one method, and nothing mounted beneath; `/dyn.*` — `dyn` and everything
-  beneath it (`/dyn.peer.shop.*` is one peer). `self` is `*`: the service
-  being called, never the caller.
+  beneath it (`/dyn.peer.shop.*` is one peer). `/P` names a method `P` and an
+  activation mounted at `P` alike. `self` is `*`: the service being called,
+  never the caller.
 - `ScopeRef::parse_checked` (strict: segments of `A-Z a-z 0-9 _ -`, an
-  optional trailing `.*`, nothing else), `ScopeRef::is_address`,
-  `ScopeRef::covers_address`.
-- `CallAddress::new(activation, method)` — a call's literal address, the
-  method one segment, so a path is told apart at its last dot only.
-- `Gate::check_at`, `Gate::check_everywhere_at`, `Gate::reach_of_public_at`:
-  the checks, told the call's address. An address scope holds a grant only
-  inside a call it covers, and there stands as `*` (in the decision, in
-  `Reach.held_on`, and as a ceiling layer). A whole-service method is
-  admitted on `*`, its activation's address, its own, or a `.*` above it;
-  never on a data scope (KEEL-31). A refusal there names `/<activation>`.
+  optional trailing `.*`, nothing else; `self` → `*`). Every scope being
+  written — a membership granted, a role or team grant stored, a ceiling
+  minted — goes through it. `ScopeRef::is_address`, `ScopeRef::covers_address`.
+- `CallAddress::new(activation, method)` and `CallAddress::of_segments(segments,
+  method)` — a call's literal address; the method one segment, and from
+  routed segments a key holding a dot is refused rather than split.
+- `DispatchedCall::new(address, grant)` — one dispatched call: its address and
+  the grant it dispatches to, paired once by the dispatcher.
+- `Gate::check_at(caller, &call, target)`, `Gate::check_everywhere_at(caller,
+  &call)`, `Gate::reach_of_public_at(caller, &call)`: the checks of a
+  dispatched call, for its own grant. An address scope holds a grant only
+  inside a call it covers and only for that call's grant, and there stands as
+  `*` (in the decision, in `Reach.held_on`, and as a ceiling layer). Any other
+  check — a second grant inside the call, a seam, a store's sub-check — goes
+  through `check` / `check_everywhere`, where an address scope holds nothing.
+  A whole-service method is admitted on `*`, its activation's address, its
+  own, or a `.*` above it; never on a data scope (KEEL-31). A refusal there
+  names `/<activation>`.
 
-### Changed
+### Changed — behavior, even with no address passed
 
-- The gate owns addresses: a scope beginning with `/` is never a data scope.
-  Told no address (`check`, `check_everywhere`, `held_on`, `held_on_by`,
-  `reach_of_public`), it holds nothing; a `Resolve` chain that names one has
-  it dropped. A service whose own data scopes began with `/` loses them (none
-  is known). Every other answer is as it was.
+- **A scope beginning with `/` is never a data scope.** A membership or
+  ceiling entry on one holds nothing unless a dispatched call it covers is
+  being decided, and a `Resolve` chain that names one has it dropped (so a
+  target whose own scopes begin with `/` can be held only through `*`).
+  Why: the gate owns addresses — if a `/` name could still be a service's
+  data scope, a resolver (or a target value it echoes) could forge an
+  address into a chain, and one name would mean two things. A service whose
+  own data scopes began with `/` (paths, say) loses them in 0.3.4 and must
+  rename them; none is known.
+- **`self` is reserved.** A membership, ceiling entry or chain entry held as
+  the raw name `self` (through the lenient `ScopeRef::parse` or serde) holds
+  nothing — no longer a data scope that made a targetless read "held
+  anywhere". Why: `parse_checked` reads `self` as `*`; a raw `self` meaning
+  anything else would be a second, surprising meaning of one spelling.
 
 ## [0.3.3] — 2026-11-10
 
